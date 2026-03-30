@@ -22,6 +22,7 @@ type Message struct {
 	Files      []FileAttachment  // Optional file attachments
 	Audio      *AudioAttachment  // Optional audio/voice attachment
 	FromVoice  bool              // Whether this message was transcribed from voice
+	CreateTime time.Time         // When the message was created on the platform (zero = unknown)
 }
 
 // ImageAttachment represents an image sent to or from an LLM.
@@ -224,6 +225,10 @@ type PipeContext struct {
 	Sessions   SessionProvider    // Session management
 	Translator Translator         // Translation services
 	GetAgents  func() []AgentInfo // Callback to list available AI agents
+	// Inject allows a pipe to synthesize an inbound message into a session (e.g. webhook/heartbeat).
+	// When called, the engine routes the content through the full pipe-and-LLM pipeline
+	// as if it were a real user message for the given sessionKey.
+	Inject func(ctx context.Context, sessionKey, content string)
 }
 
 // PipeFactory creates a Pipe instance.
@@ -260,8 +265,9 @@ type UserQuestionOption struct {
 
 // ModelOption describes a selectable AI model.
 type ModelOption struct {
-	Name string
-	Desc string
+	Name  string // model identifier passed to the CLI / API
+	Desc  string // short description or display name
+	Alias string // optional short alias for the /model command (e.g. "codex" for "gpt-5.3-codex")
 }
 
 // ProviderConfig holds API provider settings for an LLM.
@@ -270,8 +276,9 @@ type ProviderConfig struct {
 	APIKey   string
 	BaseURL  string
 	Model    string
-	Thinking string
-	Env      map[string]string
+	Models   []ModelOption     // pre-configured list of available models for this provider
+	Thinking string            // override thinking type ("disabled", "enabled", or "" for no rewrite)
+	Env      map[string]string // extra env vars passed to the provider process
 }
 
 // PermissionModeInfo describes a security/permission mode.
@@ -294,4 +301,252 @@ type HistoryEntry struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
+}
+
+// ──────────────────────────────────────────────────────────────
+// Extended Dialog (Platform) Interfaces
+// ──────────────────────────────────────────────────────────────
+
+// TypingIndicator is an optional interface for platforms that can show a
+// "processing" indicator (typing bubble, emoji reaction, etc.) while the
+// agent is working. StartTyping must not block; it returns a stop function
+// that the caller must invoke when processing ends.
+type TypingIndicator interface {
+	StartTyping(ctx context.Context, replyCtx any) (stop func())
+}
+
+// ImageSender is an optional interface for platforms that support sending images.
+type ImageSender interface {
+	SendImage(ctx context.Context, replyCtx any, img ImageAttachment) error
+}
+
+// FileSender is an optional interface for platforms that support sending files.
+type FileSender interface {
+	SendFile(ctx context.Context, replyCtx any, file FileAttachment) error
+}
+
+// CommandRegistrar is an optional interface for platforms that support
+// registering commands to the platform's native menu (e.g. Telegram setMyCommands).
+type CommandRegistrar interface {
+	RegisterCommands(commands []BotCommandInfo) error
+}
+
+// ChannelNameResolver is an optional interface for platforms that can resolve
+// channel IDs to human-readable names.
+type ChannelNameResolver interface {
+	ResolveChannelName(channelID string) (string, error)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Extended LLM Interfaces
+// ──────────────────────────────────────────────────────────────
+
+// FormattingInstructionProvider is an optional interface for platforms that
+// provide platform-specific formatting instructions for the agent system prompt
+// (e.g., Slack mrkdwn vs standard Markdown).
+type FormattingInstructionProvider interface {
+	FormattingInstructions() string
+}
+
+// PlatformPromptInjector is an optional interface for LLMs that can receive
+// platform-specific prompt fragments before a session starts.
+type PlatformPromptInjector interface {
+	SetPlatformPrompt(prompt string)
+}
+
+// SystemPromptSupporter is an optional marker interface for LLMs that
+// natively inject the system prompt (e.g. via --append-system-prompt).
+type SystemPromptSupporter interface {
+	HasSystemPromptSupport() bool
+}
+
+// SessionEnvInjector is an optional interface for LLMs that accept
+// per-session environment variables (e.g. CC_PROJECT, CC_SESSION_KEY).
+type SessionEnvInjector interface {
+	SetSessionEnv(env []string)
+}
+
+// ToolAuthorizer is an optional interface for LLMs that support dynamic tool authorization.
+type ToolAuthorizer interface {
+	AddAllowedTools(tools ...string) error
+	GetAllowedTools() []string
+}
+
+// HistoryProvider is an optional interface for LLMs that can retrieve
+// conversation history from their backend session files.
+type HistoryProvider interface {
+	GetSessionHistory(ctx context.Context, sessionID string, limit int) ([]HistoryEntry, error)
+}
+
+// ProviderSwitcher is an optional interface for LLMs that support multiple API providers.
+type ProviderSwitcher interface {
+	SetProviders(providers []ProviderConfig)
+	SetActiveProvider(name string) bool
+	GetActiveProvider() *ProviderConfig
+	ListProviders() []ProviderConfig
+}
+
+// MemoryFileProvider is an optional interface for LLMs that support
+// persistent instruction files (CLAUDE.md, AGENTS.md, GEMINI.md, etc.).
+type MemoryFileProvider interface {
+	ProjectMemoryFile() string // project-level instruction file
+	GlobalMemoryFile() string  // user-level instruction file
+}
+
+// ModelSwitcher is an optional interface for LLMs that support runtime model switching.
+// Model changes take effect on the next session start.
+type ModelSwitcher interface {
+	SetModel(model string)
+	GetModel() string
+	AvailableModels(ctx context.Context) []ModelOption
+}
+
+// ReasoningEffortSwitcher is an optional interface for LLMs that support
+// runtime switching of reasoning effort.
+type ReasoningEffortSwitcher interface {
+	SetReasoningEffort(effort string)
+	GetReasoningEffort() string
+	AvailableReasoningEfforts() []string
+}
+
+// UsageReporter is an optional interface for LLMs that can report account
+// or model quota usage from their backing provider.
+type UsageReporter interface {
+	GetUsage(ctx context.Context) (*UsageReport, error)
+}
+
+// UsageReport is a provider-neutral quota snapshot returned by UsageReporter.
+type UsageReport struct {
+	Provider  string
+	AccountID string
+	UserID    string
+	Email     string
+	Plan      string
+	Buckets   []UsageBucket
+	Credits   *UsageCredits
+}
+
+// UsageBucket groups one logical quota, such as standard requests or code review.
+type UsageBucket struct {
+	Name         string
+	Allowed      bool
+	LimitReached bool
+	Windows      []UsageWindow
+}
+
+// UsageWindow describes a single quota window.
+type UsageWindow struct {
+	Name              string
+	UsedPercent       int
+	WindowSeconds     int
+	ResetAfterSeconds int
+	ResetAtUnix       int64
+}
+
+// UsageCredits contains optional credit/balance metadata.
+type UsageCredits struct {
+	HasCredits bool
+	Unlimited  bool
+	Balance    string
+}
+
+// ContextCompressor is an optional interface for LLMs that support
+// compressing the conversation context within a running session.
+// CompressCommand returns the agent's native slash command (e.g. "/compact");
+// return "" if not supported.
+type ContextCompressor interface {
+	CompressCommand() string
+}
+
+// CommandProvider is an optional interface for LLMs that expose custom slash
+// commands via local *.md files (e.g. .claude/commands/*.md).
+type CommandProvider interface {
+	CommandDirs() []string
+}
+
+// SkillProvider is an optional interface for LLMs that expose skills via
+// local directories (each containing a SKILL.md file).
+type SkillProvider interface {
+	SkillDirs() []string
+}
+
+// SessionDeleter is an optional interface for LLMs that support deleting sessions.
+type SessionDeleter interface {
+	DeleteSession(ctx context.Context, sessionID string) error
+}
+
+// WorkDirSwitcher is an optional interface for LLMs that support runtime
+// work directory switching. Takes effect on next session start.
+type WorkDirSwitcher interface {
+	SetWorkDir(dir string)
+	GetWorkDir() string
+}
+
+// ModeSwitcher is an optional interface for LLMs that support runtime permission mode switching.
+type ModeSwitcher interface {
+	SetMode(mode string)
+	GetMode() string
+	PermissionModes() []PermissionModeInfo
+}
+
+// ──────────────────────────────────────────────────────────────
+// Doctor / Diagnostics Types
+// ──────────────────────────────────────────────────────────────
+
+// DoctorStatus represents the outcome of a single diagnostic check.
+type DoctorStatus int
+
+const (
+	DoctorPass DoctorStatus = iota // Check passed
+	DoctorWarn                     // Check passed with a warning
+	DoctorFail                     // Check failed
+)
+
+// Icon returns an emoji indicator for the status.
+func (s DoctorStatus) Icon() string {
+	switch s {
+	case DoctorPass:
+		return "✅"
+	case DoctorWarn:
+		return "⚠️"
+	default:
+		return "❌"
+	}
+}
+
+// DoctorCheckResult is the result of a single diagnostic check.
+type DoctorCheckResult struct {
+	Name    string       // Display name
+	Status  DoctorStatus // Pass / Warn / Fail
+	Detail  string       // Human-readable detail or error message
+	Latency string       // Optional latency string (e.g. "42ms")
+}
+
+// DoctorChecker is an optional interface for LLMs that can supply
+// custom diagnostic checks.
+type DoctorChecker interface {
+	DoctorChecks(ctx context.Context) []DoctorCheckResult
+}
+
+// AgentDoctorInfo is an optional interface for LLMs that can report
+// their binary path and version for diagnostics.
+type AgentDoctorInfo interface {
+	BinaryPath() string
+	Version(ctx context.Context) (string, error)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Workspace Binding
+// ──────────────────────────────────────────────────────────────
+
+// WorkspaceBindingProvider is an optional interface for LLMs that support
+// binding a session to a specific workspace directory. Workspace bindings
+// persist across restarts and are keyed by session key.
+type WorkspaceBindingProvider interface {
+	// GetWorkspaceBinding returns the workspace path bound to a session, or "" if none.
+	GetWorkspaceBinding(sessionKey string) string
+	// SetWorkspaceBinding binds a session key to a workspace path.
+	SetWorkspaceBinding(sessionKey, workspacePath string) error
+	// ClearWorkspaceBinding removes the binding for a session key.
+	ClearWorkspaceBinding(sessionKey string) error
 }

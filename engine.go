@@ -55,6 +55,24 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 			}
 			return list
 		},
+		Inject: func(_ context.Context, sessionKey, content string) {
+			e.mu.RLock()
+			var firstDialog Dialog
+			for _, d := range e.dialogs {
+				firstDialog = d
+				break
+			}
+			e.mu.RUnlock()
+
+			if firstDialog == nil {
+				slog.Warn("engine.Inject: no dialog registered, dropping message", "sessionKey", sessionKey)
+				return
+			}
+			e.handleMessage(firstDialog, &Message{
+				SessionKey: sessionKey,
+				Content:    content,
+			})
+		},
 	})
 
 	// Note: Cron, Relay, and API require a dataDir

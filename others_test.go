@@ -8,11 +8,11 @@ import (
 )
 
 func TestDoctor(t *testing.T) {
-	results := RunDoctor(context.Background(), nil)
+	results := RunDoctorChecks(context.Background(), nil, nil)
 	assert.NotEmpty(t, results)
 
-	report := FormatDoctor(results)
-	assert.Contains(t, report, "OS")
+	report := FormatDoctorResults(results)
+	assert.Contains(t, report, "Doctor Report")
 }
 
 func TestStreaming(t *testing.T) {

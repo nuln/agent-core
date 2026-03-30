@@ -1,215 +1,263 @@
 # Agent Core
 
-A powerful Go AI Agent core library providing session management, message routing, scheduling, and voice processing capabilities.
+`github.com/nuln/agent-core` — Go AI Agent 核心框架，提供消息路由引擎、插件注册、会话管理、配置系统、定时任务和语音处理等基础能力。
 
-English | [简体中文](./README-zh.md)
+## 功能特性
 
-## Features
+- **Pipe 管道** — 有序消息处理链，每个 Pipe 可拦截或透传消息
+- **插件注册** — Pipe / Dialog / LLM 三类插件均通过 `init()` 自动注册
+- **配置规格系统** — 插件声明配置规格，框架提供 env→opts→default 解析链
+- **会话管理** — 基于 SessionKey 的会话跟踪与 metadata
+- **定时任务** — CronScheduler，持久化存储任务配置
+- **消息转发** — RelayManager，多 Bot 协作
+- **卡片消息** — 构建结构化交互卡片（飞书等平台）
+- **国际化** — 内置中/英文，可扩展
+- **语音处理** — STT/TTS 接口
+- **诊断工具** — RunDoctorChecks 系统健康检查
+- **Unix Socket API** — 进程间通信管理接口
 
-- **Session Management** - Flexible session tracking and management system
-- **Multi-Platform Support** - Support for multiple dialog platforms (extensible interface)
-- **LLM Integration** - Support for multiple LLM providers with flexible switching
-- **Scheduling** - Cron-based job scheduling system
-- **Voice Processing** - Integrated Speech-to-Text (STT) and Text-to-Speech (TTS)
-- **Card Support** - Build and render structured card messages
-- **Internationalization** - Built-in English and Chinese language support
-- **Permission Management** - Permission request and approval workflow
-- **Message Relay** - Bot-to-bot message relay and collaboration
-- **Unix Socket API** - Local Unix Socket interface for inter-process communication
-- **Diagnostics** - System health checks and diagnostic tools
-
-## Quick Start
-
-### Installation
+## 安装
 
 ```bash
 go get github.com/nuln/agent-core
 ```
 
-## Core Components
+## 核心接口
 
-### Engine
-
-The core engine responsible for coordinating dialog platforms and LLMs, managing message routing.
+### Pipe
 
 ```go
-engine := agent.NewEngine(sessions, translator, stt, tts, dataDir)
-engine.RegisterDialog(platform)
-engine.RegisterLLM(llm)
+type Pipe interface {
+    Handle(ctx context.Context, p Dialog, msg *Message) bool
+}
+
+// 注册（在插件 init() 中）
+agent.RegisterPipe("name", priority, func(pctx agent.PipeContext) agent.Pipe {
+    return &MyPipe{}
+})
 ```
 
-### Session
+`Handle` 返回 `true` 停止链路，`false` 继续传递。
 
-The session manager tracks conversation history between users and bots.
-
-```go
-session := sessionProvider.GetOrCreateSession(sessionID)
-session.AppendMessage(message)
-```
-
-### Dialog
-
-Dialog platform interface for integrating with various messaging applications.
+### Dialog（IM 平台）
 
 ```go
 type Dialog interface {
     Name() string
     Start(handler MessageHandler) error
-    Send(ctx context.Context, replyCtx any, content string) error
+    Reply(ctx context.Context, replyCtx any, content string) error
     Stop() error
 }
+
+agent.RegisterDialog("name", func(opts map[string]any) (agent.Dialog, error) {
+    return &MyDialog{}, nil
+})
 ```
 
 ### LLM
-
-LLM interface for integrating different large language models.
 
 ```go
 type LLM interface {
     Name() string
     Description() string
-    Chat(ctx context.Context, msgs []*Message) (string, error)
+    Chat(ctx context.Context, sessionKey string, msgs []*Message) (string, error)
+}
+
+agent.RegisterLLM("name", func(opts map[string]any) (agent.LLM, error) {
+    return &MyLLM{}, nil
+})
+```
+
+### PipeContext
+
+```go
+type PipeContext struct {
+    Sessions   SessionProvider
+    Translator Translator
+    GetAgents  func() []AgentInfo
+    // Inject 将 content 作为用户输入注入到 sessionKey 对应的会话
+    Inject     func(ctx context.Context, sessionKey, content string)
 }
 ```
 
-### CronScheduler
-
-Manages and executes scheduled tasks.
+### Message
 
 ```go
-scheduler := agent.NewCronScheduler(store, engine)
-scheduler.Start()
-scheduler.AddJob(cronJob)
+type Message struct {
+    MessageID  string
+    SessionKey string
+    UserID     string
+    Access     string        // "private" | "group" | ...
+    Content    string
+    Role       string        // "user" | "assistant"
+    CreateTime time.Time
+    ReplyCtx   any           // 平台回复上下文（不透明）
+}
 ```
 
-### Pipes
-
-Configurable message processing pipelines for implementing permission checks, logging, and more.
-
-## Configuration
-
-### Environment Variables
-
-- `AGENT_DATA_DIR` - Data storage directory path
-- `AGENT_LOG_LEVEL` - Log level (debug, info, warn, error)
-
-### Data Directory Structure
-
-```
-data_dir/
-├── crons/
-│   └── jobs.json       # Cron job configuration
-├── sessions/
-│   └── *.json          # Session data 
-├── relay_bindings.json # Message relay configuration
-└── run/
-    └── api.sock        # Unix Socket
-```
-
-## API
-
-### Start Engine
+## 引擎
 
 ```go
-if err := engine.Start(ctx); err != nil {
+engine := agent.NewEngine(sessions, translator, stt, tts, dataDir)
+
+// 加载通过 RegisterDialog/RegisterLLM 注册的插件
+if err := engine.LoadPlugins(agent.EngineConfig{
+    Dialogs: []agent.PluginConfig{{Type: "lark", Options: map[string]any{"app_id": "...", "app_secret": "..."}}},
+    LLMs:    []agent.PluginConfig{{Type: "claudecode", Options: map[string]any{"work_dir": "."}}},
+    DefaultLLM: "claudecode",
+}); err != nil {
+    log.Fatal(err)
+}
+
+// 或 AutoLoad：从已注册插件中自动发现可用的（依赖环境变量）
+engine.AutoLoad()
+```
+
+## 配置规格系统
+
+### 插件声明配置（在 init() 中）
+
+```go
+agent.RegisterPluginConfigSpec(agent.PluginConfigSpec{
+    PluginName:  "myplugin",
+    PluginType:  "pipe",
+    Description: "插件描述",
+    Fields: []agent.ConfigField{
+        {
+            EnvVar:      "MYPLUGIN_TOKEN",
+            Key:         "token",
+            Description: "API Token",
+            Required:    true,
+            Type:        agent.ConfigFieldSecret,
+        },
+        {
+            EnvVar:  "MYPLUGIN_PORT",
+            Key:     "port",
+            Default: "8080",
+            Type:    agent.ConfigFieldInt,
+        },
+    },
+})
+```
+
+### 解析配置（env → opts → default）
+
+```go
+// 在插件工厂函数中
+spec, _ := agent.GetPluginConfigSpec("myplugin")
+cfg := agent.ResolveAllConfig(spec, opts)
+port := cfg["port"]  // 优先 env MYPLUGIN_PORT，否则 opts["port"]，否则 "8080"
+
+// 或单字段解析
+val, found := agent.ResolveConfigValue(field, opts)
+```
+
+### 加载 .env 文件
+
+```go
+// 不覆盖已有环境变量
+if err := agent.AutoLoadEnvFile(".env"); err != nil {
     log.Fatal(err)
 }
 ```
 
-### Handle Messages
+### 校验必填配置
 
 ```go
-engine.handleMessage(dialog, &agent.Message{
-    Content: "User input",
-    Role: agent.RoleUser,
-})
+errs := agent.ValidateAllPluginConfigs(nil)
+for _, e := range errs {
+    log.Printf("配置缺失: %v", e)
+}
 ```
 
-### Scheduled Tasks
+### 生成配置模板
 
 ```go
+// 生成所有插件的 .env 模板
+fmt.Print(agent.GenerateEnvTemplate())
+
+// 生成指定插件的 .env 模板
+fmt.Print(agent.GenerateEnvTemplate("webhook", "lark"))
+```
+
+## 会话管理
+
+```go
+sessions := agent.NewSessionManager()
+
+// 获取或创建会话（自动激活）
+session := sessions.GetOrCreateActive(sessionKey)
+session.AppendMessage(&agent.Message{Role: "user", Content: "Hello"})
+
+// 设置元数据
+session.SetMetadata("key", "value")
+val := session.GetMetadata("key")
+
+// pending action 工作流
+session.SetPendingAction("CONFIRM_OP")
+if session.GetPendingAction() == "CONFIRM_OP" { ... }
+```
+
+## 定时任务
+
+```go
+store, _ := agent.NewCronStore(dataDir)
+scheduler := agent.NewCronScheduler(store, engine)
+scheduler.Start()
+
 job := &agent.CronJob{
-    ID: "task-1",
-    CronExpr: "0 9 * * *",      // Daily at 9:00 AM
-    Project: "my-agent",
-    SessionKey: "account:chat:user",
-    Prompt: "Task prompt",
-    Enabled: true,
+    ID:         "daily-report",
+    CronExpr:   "0 9 * * *",
+    SessionKey: "user:12345:main",
+    Prompt:     "生成今日报告",
+    Enabled:    true,
 }
 scheduler.AddJob(job)
 ```
 
-### Send Card Messages
+## 卡片消息
 
 ```go
 card := agent.NewCard().
-    Title("Card Title", "#2196F3").
-    Markdown("**Bold content**").
+    Title("标题", "#2196F3").
+    Markdown("**加粗内容**").
     Buttons(
-        agent.PrimaryBtn("Button", "action_value"),
+        agent.PrimaryBtn("确认", "confirm"),
+        agent.DangerBtn("取消", "cancel"),
     ).
     Build()
 
-if err := dialog.SendCard(ctx, replyCtx, card); err != nil {
-    log.Printf("Failed to send card: %v", err)
+// 需要 Dialog 实现 CardSender 接口
+if cs, ok := dialog.(agent.CardSender); ok {
+    cs.SendCard(ctx, replyCtx, card)
 }
 ```
 
-## Testing
+## 健康检查
 
-Run all tests:
-
-```bash
-make test
+```go
+results := agent.RunDoctorChecks()
+fmt.Println(agent.FormatDoctorResults(results))
 ```
 
-Generate coverage report:
+## 数据目录结构
 
-```bash
-make coverage
+```
+data_dir/
+├── crons/
+│   └── jobs.json          定时任务配置
+├── relay_bindings.json    消息转发绑定
+└── run/
+    └── api.sock           Unix Socket API
 ```
 
-## Code Quality
-
-### Format Code
+## 测试
 
 ```bash
-make fmt
+cd agent-core && go test ./... -timeout 30s
 ```
-
-### Lint Code
-
-```bash
-make lint
-```
-
-### Check Dependencies
-
-```bash
-make check
-```
-
-## CI/CD
-
-The project uses GitHub Actions for automated testing and checks:
-
-- **Continuous Integration** - Run tests on Linux, macOS, and Windows
-- **Code Quality** - golangci-lint for static analysis
-- **Security Checks** - Go vulnerability scanning
-- **Dependency Checks** - Verify go.mod integrity
-
-See [.github/workflows/ci.yml](./.github/workflows/ci.yml) for details.
-
-## Contributing
-
-Pull requests and issues are welcome!
 
 ## License
 
-MIT License - See [LICENSE](./LICENSE) file for details
+MIT — See [LICENSE](./LICENSE)
 
-## Related Resources
-
-- [Go Documentation](https://pkg.go.dev/github.com/nuln/agent-core)
-- [robfig/cron](https://github.com/robfig/cron) - Cron scheduling library
-- [stretchr/testify](https://github.com/stretchr/testify) - Testing framework

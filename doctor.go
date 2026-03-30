@@ -4,61 +4,348 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 )
 
-type CheckResult struct {
-	Name    string
-	Passed  bool
-	Detail  string
-	Latency time.Duration
-}
+// RunDoctorChecks performs all built-in diagnostic checks plus any
+// agent-specific checks provided via the DoctorChecker interface.
+// llm may be nil (agent binary checks will be skipped).
+func RunDoctorChecks(ctx context.Context, llm LLM, dialogs []Dialog) []DoctorCheckResult {
+	var results []DoctorCheckResult
 
-func RunDoctor(ctx context.Context, _ *Engine) []CheckResult {
-	var results []CheckResult
-
-	// 1. Check System
-	results = append(results, CheckResult{
-		Name:   "OS",
-		Passed: true,
-		Detail: fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-	})
-
-	// 2. Check Dependencies
-	ffmpegPath, err := exec.LookPath("ffmpeg")
-	results = append(results, CheckResult{
-		Name:   "FFmpeg",
-		Passed: err == nil,
-		Detail: ffmpegPath,
-	})
-
-	// 3. Check Network
-	start := time.Now()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", "api.openai.com:443")
-	if err == nil {
-		_ = conn.Close()
+	if llm != nil {
+		results = append(results, checkLLMBinary(ctx, llm)...)
 	}
-	results = append(results, CheckResult{
-		Name:    "Network (OpenAI)",
-		Passed:  err == nil,
-		Detail:  fmt.Sprintf("%v", err),
-		Latency: time.Since(start),
-	})
+	results = append(results, checkDialogs(dialogs)...)
+	results = append(results, checkSystem(ctx)...)
+	results = append(results, checkDependencies()...)
+	results = append(results, checkNetwork(ctx)...)
+
+	if llm != nil {
+		if dc, ok := llm.(DoctorChecker); ok {
+			results = append(results, dc.DoctorChecks(ctx)...)
+		}
+	}
 
 	return results
 }
 
-func FormatDoctor(results []CheckResult) string {
+// FormatDoctorResults renders a human-readable summary of doctor results.
+func FormatDoctorResults(results []DoctorCheckResult) string {
 	var sb strings.Builder
+	sb.WriteString("🩺 Doctor Report\n\n")
+
+	passCount, warnCount, failCount := 0, 0, 0
 	for _, r := range results {
-		icon := "✅"
-		if !r.Passed {
-			icon = "❌"
+		switch r.Status {
+		case DoctorPass:
+			passCount++
+		case DoctorWarn:
+			warnCount++
+		case DoctorFail:
+			failCount++
 		}
-		sb.WriteString(fmt.Sprintf("%s %s: %s (%v)\n", icon, r.Name, r.Detail, r.Latency))
+
+		latStr := ""
+		if r.Latency != "" {
+			latStr = " (" + r.Latency + ")"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s%s\n   %s\n\n", r.Status.Icon(), r.Name, latStr, r.Detail))
 	}
+
+	sb.WriteString(fmt.Sprintf("Summary: ✅ %d  ⚠️ %d  ❌ %d", passCount, warnCount, failCount))
 	return sb.String()
+}
+
+// ─────────────────────────────────────────
+
+func checkLLMBinary(ctx context.Context, llm LLM) []DoctorCheckResult {
+	info, hasInfo := llm.(AgentDoctorInfo)
+
+	binName := llm.Name()
+	if hasInfo {
+		if p := info.BinaryPath(); p != "" {
+			binName = p
+		}
+	}
+
+	// Resolve binary
+	resolved, err := exec.LookPath(binName)
+	if err != nil {
+		// Try base name if a full path was given but not found
+		if base := filepath.Base(binName); base != binName {
+			resolved, err = exec.LookPath(base)
+		}
+	}
+	if err != nil {
+		return []DoctorCheckResult{{
+			Name:   fmt.Sprintf("Agent CLI (%s)", binName),
+			Status: DoctorFail,
+			Detail: "not found in PATH",
+		}}
+	}
+
+	detail := resolved
+	if hasInfo {
+		tctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if ver, err := info.Version(tctx); err == nil && ver != "" {
+			if len(ver) > 80 {
+				ver = ver[:80]
+			}
+			detail = ver
+		}
+	} else {
+		tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(tctx, binName, "--version").Output(); err == nil {
+			ver := strings.TrimSpace(string(out))
+			if len(ver) > 80 {
+				ver = ver[:80]
+			}
+			detail = ver
+		}
+	}
+
+	return []DoctorCheckResult{{
+		Name:   fmt.Sprintf("Agent CLI (%s)", binName),
+		Status: DoctorPass,
+		Detail: detail,
+	}}
+}
+
+func checkDialogs(dialogs []Dialog) []DoctorCheckResult {
+	var results []DoctorCheckResult
+	for _, d := range dialogs {
+		results = append(results, DoctorCheckResult{
+			Name:   fmt.Sprintf("Platform (%s)", d.Name()),
+			Status: DoctorPass,
+			Detail: "connected",
+		})
+	}
+	if len(results) == 0 {
+		results = append(results, DoctorCheckResult{
+			Name:   "Platforms",
+			Status: DoctorWarn,
+			Detail: "no platforms configured",
+		})
+	}
+	return results
+}
+
+func checkSystem(ctx context.Context) []DoctorCheckResult {
+	var results []DoctorCheckResult
+
+	// Go runtime memory
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	allocMB := memStats.Alloc / 1024 / 1024
+	sysMB := memStats.Sys / 1024 / 1024
+	results = append(results, DoctorCheckResult{
+		Name:   "Memory (Go runtime)",
+		Status: DoctorPass,
+		Detail: fmt.Sprintf("alloc %d MB / sys %d MB", allocMB, sysMB),
+	})
+
+	// System memory (Linux)
+	if runtime.GOOS == "linux" {
+		if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+			var totalKB, availKB uint64
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, "MemTotal:") {
+					fmt.Sscanf(line, "MemTotal: %d kB", &totalKB)
+				} else if strings.HasPrefix(line, "MemAvailable:") {
+					fmt.Sscanf(line, "MemAvailable: %d kB", &availKB)
+				}
+			}
+			if totalKB > 0 {
+				totalMB := totalKB / 1024
+				availMB := availKB / 1024
+				usedPct := 100 - (availKB*100)/totalKB
+				status := DoctorPass
+				if usedPct > 90 {
+					status = DoctorFail
+				} else if usedPct > 75 {
+					status = DoctorWarn
+				}
+				results = append(results, DoctorCheckResult{
+					Name:   "System Memory",
+					Status: status,
+					Detail: fmt.Sprintf("%d MB available / %d MB total (%d%% used)", availMB, totalMB, usedPct),
+				})
+			}
+		}
+	}
+
+	// CPU info
+	results = append(results, DoctorCheckResult{
+		Name:   "CPU",
+		Status: DoctorPass,
+		Detail: fmt.Sprintf("%d cores, %s/%s", runtime.NumCPU(), runtime.GOOS, runtime.GOARCH),
+	})
+
+	// Load average (Linux)
+	if runtime.GOOS == "linux" {
+		if data, err := os.ReadFile("/proc/loadavg"); err == nil {
+			parts := strings.Fields(string(data))
+			if len(parts) >= 3 {
+				status := DoctorPass
+				detail := fmt.Sprintf("load avg: %s %s %s", parts[0], parts[1], parts[2])
+				var load1 float64
+				fmt.Sscanf(parts[0], "%f", &load1)
+				if load1 > float64(runtime.NumCPU()*2) {
+					status = DoctorWarn
+				}
+				results = append(results, DoctorCheckResult{
+					Name:   "CPU Load",
+					Status: status,
+					Detail: detail,
+				})
+			}
+		}
+	}
+
+	// Disk space
+	if wd, err := os.Getwd(); err == nil {
+		tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(tctx, "df", "-h", wd).Output(); err == nil {
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			if len(lines) >= 2 {
+				fields := strings.Fields(lines[len(lines)-1])
+				if len(fields) >= 5 {
+					status := DoctorPass
+					usePct := strings.TrimSuffix(fields[4], "%")
+					var pct int
+					fmt.Sscanf(usePct, "%d", &pct)
+					if pct > 95 {
+						status = DoctorFail
+					} else if pct > 85 {
+						status = DoctorWarn
+					}
+					results = append(results, DoctorCheckResult{
+						Name:   "Disk Space",
+						Status: status,
+						Detail: fmt.Sprintf("%s available / %s total (%s used)", fields[3], fields[1], fields[4]),
+					})
+				}
+			}
+		}
+	}
+
+	return results
+}
+
+func checkDependencies() []DoctorCheckResult {
+	deps := []struct {
+		bin      string
+		label    string
+		required bool
+	}{
+		{"git", "Git", true},
+		{"ffmpeg", "FFmpeg (voice)", false},
+	}
+
+	var results []DoctorCheckResult
+	for _, d := range deps {
+		path, err := exec.LookPath(d.bin)
+		if err != nil {
+			status := DoctorWarn
+			if d.required {
+				status = DoctorFail
+			}
+			results = append(results, DoctorCheckResult{
+				Name:   d.label,
+				Status: status,
+				Detail: "not found in PATH",
+			})
+		} else {
+			results = append(results, DoctorCheckResult{
+				Name:   d.label,
+				Status: DoctorPass,
+				Detail: path,
+			})
+		}
+	}
+	return results
+}
+
+func checkNetwork(ctx context.Context) []DoctorCheckResult {
+	endpoints := []struct {
+		label string
+		host  string
+	}{
+		{"API (Anthropic)", "api.anthropic.com:443"},
+		{"API (OpenAI)", "api.openai.com:443"},
+	}
+
+	var results []DoctorCheckResult
+	for _, ep := range endpoints {
+		tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		start := time.Now()
+		conn, err := (&net.Dialer{}).DialContext(tctx, "tcp", ep.host)
+		latency := time.Since(start)
+		cancel()
+
+		lat := latency.Round(time.Millisecond).String()
+		if err != nil {
+			results = append(results, DoctorCheckResult{
+				Name:    ep.label,
+				Status:  DoctorWarn,
+				Detail:  fmt.Sprintf("connect failed: %v", err),
+				Latency: lat,
+			})
+			continue
+		}
+		conn.Close()
+
+		status := DoctorPass
+		if latency > 3*time.Second {
+			status = DoctorWarn
+		}
+		results = append(results, DoctorCheckResult{
+			Name:    ep.label,
+			Status:  status,
+			Detail:  "TCP connect OK",
+			Latency: lat,
+		})
+	}
+
+	// HTTPS check
+	tctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	start := time.Now()
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, _ := http.NewRequestWithContext(tctx, "HEAD", "https://api.anthropic.com", nil)
+	resp, err := client.Do(req)
+	latency := time.Since(start)
+	lat := latency.Round(time.Millisecond).String()
+	if err != nil {
+		results = append(results, DoctorCheckResult{
+			Name:    "HTTPS (Anthropic)",
+			Status:  DoctorWarn,
+			Detail:  "request failed: " + err.Error(),
+			Latency: lat,
+		})
+	} else {
+		resp.Body.Close()
+		status := DoctorPass
+		if latency > 5*time.Second {
+			status = DoctorWarn
+		}
+		results = append(results, DoctorCheckResult{
+			Name:    "HTTPS (Anthropic)",
+			Status:  status,
+			Detail:  fmt.Sprintf("HTTP %d", resp.StatusCode),
+			Latency: lat,
+		})
+	}
+
+	return results
 }
