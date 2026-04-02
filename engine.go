@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
+	"time"
 )
 
 type PluginConfig struct {
@@ -203,26 +206,45 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	// 2. Get session
 	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 	if !session.TryLock() {
-		if err := p.Reply(ctx, msg.ReplyCtx, e.translator.T("previous_processing")); err != nil {
-			slog.Debug("engine: failed to reply", "error", err)
-		}
+		_ = p.Reply(ctx, msg.ReplyCtx, e.translator.T("previous_processing"))
 		return
 	}
 	defer session.Unlock()
 
-	// 3. Select llm
-	var targetLLM LLM
-	llmName, _ := session.GetMetadata()["llm"].(string)
+	// --- 权限处理逻辑开始 ---
+	pending := session.GetPendingAction()
+	if strings.HasPrefix(pending, "confirm_tool:") {
+		if msg.Content == "继续" || msg.Content == "好" || msg.Content == "确认" || msg.Content == "允许" {
+			// 清除挂起状态并告知 LLM 用户已同意
+			session.SetPendingAction("")
+			msg.Content = fmt.Sprintf("[User Authorized: %s] 请继续执行刚才的操作。", strings.TrimPrefix(pending, "confirm_tool:"))
+		} else {
+			// 用户发了别的，认为是在取消授权或提新问题
+			session.SetPendingAction("")
+		}
+	}
+	// --- 权限处理逻辑结束 ---
 
+	// 4. Start llm session
+	llmName, _ := session.GetMetadata()["llm"].(string)
+	if llmName == "" {
+		llmName = e.defaultLLM
+	}
+	
+	actualSessionID := session.GetID()
+	if persistedID, ok := session.GetMetadata()["llm_session_id_"+llmName].(string); ok && persistedID != "" {
+		actualSessionID = persistedID
+	}
+
+	var targetLLM LLM
 	e.mu.RLock()
 	if llmName != "" {
 		targetLLM = e.llms[llmName]
 	}
-	if targetLLM == nil && e.defaultLLM != "" {
+	if targetLLM == nil {
 		targetLLM = e.llms[e.defaultLLM]
 	}
 	if targetLLM == nil {
-		// Fallback to first registered llm
 		for _, a := range e.llms {
 			targetLLM = a
 			break
@@ -231,40 +253,77 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	e.mu.RUnlock()
 
 	if targetLLM == nil {
-		if err := p.Reply(ctx, msg.ReplyCtx, e.translator.T("error", "no llm registered")); err != nil {
-			slog.Debug("engine: failed to reply", "error", err)
-		}
+		_ = p.Reply(ctx, msg.ReplyCtx, "Error: no llm registered")
 		return
 	}
 
-	// 4. Start llm session
-	agSess, err := targetLLM.StartSession(ctx, session.GetID())
+	agSess, err := targetLLM.StartSession(ctx, actualSessionID)
 	if err != nil {
-		if err := p.Reply(ctx, msg.ReplyCtx, e.translator.T("error", err)); err != nil {
-			slog.Debug("engine: failed to reply", "error", err)
-		}
+		_ = p.Reply(ctx, msg.ReplyCtx, "Error starting session: "+err.Error())
 		return
 	}
 	defer func() {
-		if err := agSess.Close(); err != nil {
-			slog.Debug("engine: failed to close session", "error", err)
-		}
+		_ = agSess.Close()
 	}()
 
 	// 5. Send message to llm
 	err = agSess.Send(msg.Content, msg.Images, msg.Files)
 	if err != nil {
-		if err := p.Reply(ctx, msg.ReplyCtx, e.translator.T("error", err)); err != nil {
-			slog.Debug("engine: failed to reply", "error", err)
-		}
+		_ = p.Reply(ctx, msg.ReplyCtx, "Error sending message: "+err.Error())
 		return
 	}
 
 	// 6. Handle llm events
+	var textBuffer strings.Builder
+	lastFlush := time.Now()
+
+	flushBuffer := func() {
+		if textBuffer.Len() > 0 {
+			if err := p.Reply(ctx, msg.ReplyCtx, textBuffer.String()); err != nil {
+				slog.Error("engine: failed to send reply", "error", err, "platform", p.Name())
+			}
+			textBuffer.Reset()
+			lastFlush = time.Now()
+		}
+	}
+
 	for ev := range agSess.Events() {
-		if ev.Type == "text" {
-			if err := p.Reply(ctx, msg.ReplyCtx, ev.Content); err != nil {
-				slog.Debug("engine: failed to reply", "error", err)
+		switch ev.Type {
+		case EventText:
+			if ev.Content != "" {
+				textBuffer.WriteString(ev.Content)
+				// 通用策略：150字符或3秒发送一次
+				if textBuffer.Len() > 150 || time.Since(lastFlush) > 3*time.Second {
+					flushBuffer()
+				}
+			}
+		case EventThinking:
+			if ev.Content != "" && textBuffer.Len() == 0 {
+				slog.Debug("engine: assistant thinking", "content", ev.Content)
+			}
+		case EventToolUse:
+			flushBuffer()
+			slog.Info("engine: tool use", "tool", ev.ToolName, "input", ev.ToolInput)
+			_ = p.Reply(ctx, msg.ReplyCtx, fmt.Sprintf("🔍 正在使用工具: %s...", ev.ToolName))
+		case EventPermissionRequest:
+			flushBuffer()
+			_ = p.Reply(ctx, msg.ReplyCtx, fmt.Sprintf("🛡️ 权限请求: %s 想执行 %s(%s)。\n\n回复“继续”允许。", ev.ToolName, ev.ToolName, ev.ToolInput))
+			session.SetPendingAction("confirm_tool:" + ev.ToolName)
+			return
+		case EventError:
+			flushBuffer()
+			slog.Error("engine: llm error", "error", ev.Error)
+			_ = p.Reply(ctx, msg.ReplyCtx, "❌ 出错了: "+ev.Error.Error())
+		case EventResult:
+			flushBuffer()
+			if ev.SessionID != "" {
+				session.SetMetadata("llm_session_id_"+llmName, ev.SessionID)
+			}
+			if ev.Error != nil {
+				_ = p.Reply(ctx, msg.ReplyCtx, "❌ 错误: "+ev.Error.Error())
+			}
+			if ev.Done {
+				return
 			}
 		}
 	}
