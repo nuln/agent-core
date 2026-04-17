@@ -1,0 +1,24 @@
+name: Security Checks
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  schedule:
+    # Every Monday 10:00 Beijing Time (UTC+8) -> 02:00 UTC Monday
+    - cron: '0 2 * * 1'
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+        cache: true
+
+    - name: Go vulnerability check
+      run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

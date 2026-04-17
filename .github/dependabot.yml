@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+    open-pull-requests-limit: 5
+    # Label PRs opened by Dependabot for easier filtering
+    labels:
+      - "dependencies"

@@ -1,0 +1,42 @@
+linters:
+  enable:
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+    - revive
+    - gofmt
+    - goimports
+    - misspell
+    - unparam
+    - nakedret
+    - prealloc
+    - whitespace
+    - errcheck
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+        severity: warning
+        disabled: true
+      - name: package-comments
+        disabled: true
+      - name: unused-parameter
+        disabled: true
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    - path: i18n.go
+      linters:
+        - misspell
+
+run:
+  timeout: 5m
+  issues-exit-code: 1
+  tests: true

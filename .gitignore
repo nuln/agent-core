@@ -1,0 +1,27 @@
+# Binaries
+bin/
+main
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Data and logs
+data/
+logs/
+*.log
+
+# Sub-module directories (managed in separate repos)
+im/
+llm/
+hook/
+
+# Dependency directories
+vendor/
+
+# OS specific
+.DS_Store
+
+# Workspace file (should not be in core repo if used for local dev only, but user asked for it)
+go.work
+go.work.sum
