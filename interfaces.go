@@ -140,6 +140,9 @@ type InlineButtonSender interface {
 // DialogFactory creates a Dialog instance from a map of options.
 type DialogFactory func(opts map[string]any) (Dialog, error)
 
+// SkillManagerFactory creates a SkillManager instance from a map of options.
+type SkillManagerFactory func(opts map[string]any) (SkillManager, error)
+
 // ──────────────────────────────────────────────────────────────
 // AI Model (LLM) Interfaces
 // ──────────────────────────────────────────────────────────────
@@ -487,6 +490,22 @@ type ModeSwitcher interface {
 	SetMode(mode string)
 	GetMode() string
 	PermissionModes() []PermissionModeInfo
+}
+
+// ──────────────────────────────────────────────────────────────
+// Skill Management & Evolution
+// ──────────────────────────────────────────────────────────────
+
+// SkillManager defines how agent skills are persisted and discovered.
+type SkillManager interface {
+	Name() string                                                    // Unique name of the manager implementation
+	Type() string                                                    // Type of the manager (e.g., "skill", "memory")
+	Description() string                                             // Short description of the manager
+	List(ctx context.Context) ([]*Skill, error)                      // List all available skills
+	Get(ctx context.Context, name string) (*Skill, error)            // Get a specific skill by name
+	Save(ctx context.Context, s *Skill) error                        // Create or update a skill
+	Delete(ctx context.Context, name string) error                   // Delete a skill
+	Extract(ctx context.Context, llm LLM, history []HistoryEntry) ([]*Skill, error) // Analyze history and propose new skills
 }
 
 // ──────────────────────────────────────────────────────────────

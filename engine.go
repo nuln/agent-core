@@ -15,25 +15,30 @@ type PluginConfig struct {
 }
 
 type EngineConfig struct {
-	Dialogs    []PluginConfig `json:"dialogs"`
-	LLMs       []PluginConfig `json:"llms"`
-	DefaultLLM string         `json:"default_llm"`
+	Dialogs            []PluginConfig `json:"dialogs"`
+	LLMs               []PluginConfig `json:"llms"`
+	SkillManagers      []PluginConfig `json:"skill_managers"`
+	SkillManagerLimits map[string]int `json:"skill_manager_limits"`
+	DefaultLLM         string         `json:"default_llm"`
 }
 
 // Engine routes messages between platforms and
 type Engine struct {
 	dialogs    map[string]Dialog
-	llms       map[string]LLM
-	sessions   SessionProvider
-	translator Translator
-	cron       *CronScheduler
-	relay      *RelayManager
-	stt        SpeechToText
-	tts        TextToSpeech
-	api        *APIServer
-	pipes      []Pipe
-	defaultLLM string
-	mu         sync.RWMutex
+	llms         map[string]LLM
+	skillManagers []SkillManager
+	sessions      SessionProvider
+	translator   Translator
+	cron         *CronScheduler
+	relay        *RelayManager
+	stt          SpeechToText
+	tts          TextToSpeech
+	api          *APIServer
+	pipes        []Pipe
+	defaultLLM   string
+	skillManagerLimits map[string]int
+	loadedSkillTypes   map[string]int
+	mu           sync.RWMutex
 }
 
 func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts TextToSpeech, dataDir string) *Engine {
@@ -44,6 +49,8 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 		tts:        tts,
 		dialogs:    make(map[string]Dialog),
 		llms:       make(map[string]LLM),
+		skillManagerLimits: make(map[string]int),
+		loadedSkillTypes:   make(map[string]int),
 	}
 
 	e.pipes = CreatePipes(PipeContext{
@@ -135,10 +142,41 @@ func (e *Engine) LoadPlugins(cfg EngineConfig) error {
 		e.RegisterLLM(aInst)
 	}
 
+	// 3. Load skill managers
+	e.skillManagerLimits = cfg.SkillManagerLimits
+	for _, smCfg := range cfg.SkillManagers {
+		sm, err := CreateSkillManager(smCfg.Type, smCfg.Options)
+		if err != nil {
+			return err
+		}
+		e.registerSkillManager(sm)
+	}
+
 	if cfg.DefaultLLM != "" {
 		e.SetDefaultLLM(cfg.DefaultLLM)
 	}
 	return nil
+}
+
+func (e *Engine) registerSkillManager(sm SkillManager) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	smType := sm.Type()
+	limit, ok := e.skillManagerLimits[smType]
+	if !ok {
+		limit = 1 // Default limit
+	}
+
+	currentCount := e.loadedSkillTypes[smType]
+	if currentCount >= limit {
+		slog.Warn("skipping skill manager: limit reached for type", "type", smType, "limit", limit, "manager", sm.Name())
+		return
+	}
+
+	e.skillManagers = append(e.skillManagers, sm)
+	e.loadedSkillTypes[smType]++
+	slog.Info("loaded skill manager", "name", sm.Name(), "type", smType, "count", e.loadedSkillTypes[smType], "limit", limit)
 }
 
 func (e *Engine) AutoLoad() {
@@ -159,6 +197,15 @@ func (e *Engine) AutoLoad() {
 			slog.Info("auto-loaded llm", "name", name)
 		} else {
 			slog.Debug("skipped llm autoload", "name", name, "reason", err)
+		}
+	}
+
+	// 3. Auto-discover skill managers
+	for _, name := range ListSkillManagerFactories() {
+		if sm, err := CreateSkillManager(name, nil); err == nil {
+			e.registerSkillManager(sm)
+		} else {
+			slog.Debug("skipped skill manager autoload", "name", name, "reason", err)
 		}
 	}
 }
@@ -266,8 +313,28 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 		_ = agSess.Close()
 	}()
 
+	// 4.5 Inject skills if available
+	finalContent := msg.Content
+	var allSkills []*Skill
+	for _, sm := range e.skillManagers {
+		skills, err := sm.List(ctx)
+		if err == nil {
+			allSkills = append(allSkills, skills...)
+		}
+	}
+
+	if len(allSkills) > 0 {
+		index := BuildSkillIndexPrompt(allSkills)
+		if pinj, ok := targetLLM.(PlatformPromptInjector); ok {
+			pinj.SetPlatformPrompt(AgentSystemPrompt() + index)
+		} else {
+			// Fallback: prepend to content for models without system prompt support
+			finalContent = fmt.Sprintf("[SYSTEM: %s]\n\n%s", index, msg.Content)
+		}
+	}
+
 	// 5. Send message to llm
-	err = agSess.Send(msg.Content, msg.Images, msg.Files)
+	err = agSess.Send(finalContent, msg.Images, msg.Files)
 	if err != nil {
 		_ = p.Reply(ctx, msg.ReplyCtx, "Error sending message: "+err.Error())
 		return
@@ -323,6 +390,22 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 				_ = p.Reply(ctx, msg.ReplyCtx, "❌ 错误: "+ev.Error.Error())
 			}
 			if ev.Done {
+				// Autonomous Evolution: Trigger skill extraction at end of session
+				if len(e.skillManagers) > 0 {
+					go func() {
+						slog.Info("engine: triggering skill extraction", "session", actualSessionID)
+						// Fetch history from LLM if supported
+						var history []HistoryEntry
+						if hp, ok := targetLLM.(HistoryProvider); ok {
+							history, _ = hp.GetSessionHistory(ctx, actualSessionID, 50)
+						}
+						if len(history) > 0 {
+							for _, sm := range e.skillManagers {
+								_, _ = sm.Extract(ctx, targetLLM, history)
+							}
+						}
+					}()
+				}
 				return
 			}
 		}

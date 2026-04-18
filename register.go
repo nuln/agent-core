@@ -126,3 +126,42 @@ func CreatePipes(ctx PipeContext) []Pipe {
 	}
 	return instances
 }
+
+// ──────────────────────────────────────────────────────────────
+// Skill Manager Registry
+// ──────────────────────────────────────────────────────────────
+
+var (
+	skillManagerFactories = make(map[string]SkillManagerFactory)
+	skillManagerMu        sync.RWMutex
+)
+
+// RegisterSkillManager registers a SkillManager implementation factory by name.
+func RegisterSkillManager(name string, factory SkillManagerFactory) {
+	skillManagerMu.Lock()
+	defer skillManagerMu.Unlock()
+	skillManagerFactories[name] = factory
+}
+
+// ListSkillManagerFactories returns the names of all currently registered SkillManagers.
+func ListSkillManagerFactories() []string {
+	skillManagerMu.RLock()
+	defer skillManagerMu.RUnlock()
+	list := make([]string, 0, len(skillManagerFactories))
+	for name := range skillManagerFactories {
+		list = append(list, name)
+	}
+	return list
+}
+
+// CreateSkillManager instantiates a SkillManager by its registered name.
+func CreateSkillManager(name string, opts map[string]any) (SkillManager, error) {
+	skillManagerMu.RLock()
+	factory, ok := skillManagerFactories[name]
+	skillManagerMu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("unknown skill manager provider %q", name)
+	}
+	return factory(opts)
+}

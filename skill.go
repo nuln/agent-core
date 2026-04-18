@@ -237,6 +237,29 @@ func BuildSkillInvocationPrompt(skill *Skill, args []string) string {
 	return sb.String()
 }
 
+// BuildSkillIndexPrompt constructs a compact index of all available skills
+// and instructions on how to use them.
+func BuildSkillIndexPrompt(skills []*Skill) string {
+	if len(skills) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n## Available Skills\n")
+	sb.WriteString("You have the following skills available. If any are relevant to the user's request, you must follow their instructions carefully.\n\n")
+
+	for _, s := range skills {
+		name := s.DisplayName
+		if name == "" {
+			name = s.Name
+		}
+		fmt.Fprintf(&sb, "- %s: %s\n", name, s.Description)
+	}
+
+	sb.WriteString("\nTo use a skill, you can refer to its instructions or ask the user to invoke it.")
+	return sb.String()
+}
+
 // normalizeCommandName folds case and treats hyphens/underscores as equivalent.
 func normalizeCommandName(s string) string {
 	return strings.ToLower(strings.ReplaceAll(s, "-", "_"))
