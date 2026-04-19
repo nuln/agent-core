@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"go.etcd.io/bbolt"
 )
 
 type PluginConfig struct {
@@ -24,38 +28,87 @@ type EngineConfig struct {
 
 // Engine routes messages between platforms and
 type Engine struct {
-	dialogs    map[string]Dialog
-	llms         map[string]LLM
-	skillManagers []SkillManager
-	sessions      SessionProvider
-	translator   Translator
-	cron         *CronScheduler
-	relay        *RelayManager
-	stt          SpeechToText
-	tts          TextToSpeech
-	api          *APIServer
-	pipes        []Pipe
-	defaultLLM   string
+	dialogs            map[string]Dialog
+	llms               map[string]LLM
+	skillManagers      []SkillManager
+	sessions           SessionProvider
+	translator         Translator
+	cron               *CronScheduler
+	relay              *RelayManager
+	stt                SpeechToText
+	tts                TextToSpeech
+	api                *APIServer
+	pipes              []Pipe
+	defaultLLM         string
 	skillManagerLimits map[string]int
 	loadedSkillTypes   map[string]int
-	mu           sync.RWMutex
+	db                 *bbolt.DB
+	interactionLogger  *InteractionLogger
+	sessionState       SessionStateManager
+	reflector          Reflector
+	mu                 sync.RWMutex
 }
 
 func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts TextToSpeech, dataDir string) *Engine {
 	e := &Engine{
-		sessions:   sessions,
-		translator: t,
-		stt:        stt,
-		tts:        tts,
-		dialogs:    make(map[string]Dialog),
-		llms:       make(map[string]LLM),
+		sessions:           sessions,
+		translator:         t,
+		stt:                stt,
+		tts:                tts,
+		dialogs:            make(map[string]Dialog),
+		llms:               make(map[string]LLM),
 		skillManagerLimits: make(map[string]int),
 		loadedSkillTypes:   make(map[string]int),
 	}
 
+	var db *bbolt.DB
+	if dataDir != "" {
+		dbPath := filepath.Join(dataDir, "agent.db")
+		_ = os.MkdirAll(dataDir, 0o755)
+		var err error
+		db, err = bbolt.Open(dbPath, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
+		if err != nil {
+			slog.Error("engine: failed to open boltdb", "path", dbPath, "error", err)
+		} else {
+			e.db = db
+		}
+	}
+
+	// Initialize Core Stores
+	if e.db != nil {
+		// SessionManager (if not provided)
+		if e.sessions == nil {
+			sessKV, _ := NewBoltStore(e.db, "_core/sessions")
+			e.sessions = NewSessionManager(sessKV)
+		}
+
+		// Cron Store
+		cronKV, _ := NewBoltStore(e.db, "_core/crons")
+		cStore, _ := NewCronStore(cronKV)
+		e.cron = NewCronScheduler(cStore, e)
+
+		// Interaction logger for tracing Dialog<->LLM interactions
+		logStore, _ := NewBoltStore(e.db, "_core/interactions")
+		e.interactionLogger = NewInteractionLogger(logStore)
+
+		// Session State Manager
+		stateKV, _ := NewBoltStore(e.db, "_core/session_states")
+		e.sessionState = NewSessionStateManager(stateKV)
+
+		// Reflector
+		e.reflector = NewSessionReflector(e.sessions, nil, e.skillManagers)
+	}
+
+	var storage KVStoreProvider
+	if e.db != nil {
+		storage = NewScopedStoreProvider(e.db, "_core/pipes")
+	}
+
 	e.pipes = CreatePipes(PipeContext{
-		Sessions:   sessions,
+		Sessions:   e.sessions,
 		Translator: t,
+		Storage:    storage,
+		State:      e.sessionState,
 		GetAgents: func() []AgentInfo {
 			e.mu.RLock()
 			defer e.mu.RUnlock()
@@ -85,15 +138,12 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 		},
 	})
 
-	// Note: Cron, Relay, and API require a dataDir
 	if dataDir != "" {
-		cStore, err := NewCronStore(dataDir)
-		if err != nil {
-			slog.Error("engine: failed to create cron store", "error", err)
-		} else {
-			e.cron = NewCronScheduler(cStore, e)
+		var relayStore KVStore
+		if e.db != nil {
+			relayStore, _ = NewBoltStore(e.db, "_core/relays")
 		}
-		e.relay = NewRelayManager(dataDir, e)
+		e.relay = NewRelayManager(relayStore, e)
 		api, err := NewAPIServer(dataDir, e)
 		if err != nil {
 			slog.Error("engine: failed to create api server", "error", err)
@@ -108,6 +158,11 @@ func (e *Engine) RegisterDialog(p Dialog) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.dialogs[p.Name()] = p
+
+	// Inject scoped storage if the Dialog plugin supports it.
+	if sa, ok := p.(StorageAware); ok && e.db != nil {
+		sa.SetStorage(NewScopedStoreProvider(e.db, "plugins/"+p.Name()))
+	}
 }
 
 func (e *Engine) RegisterLLM(a LLM) {
@@ -116,6 +171,18 @@ func (e *Engine) RegisterLLM(a LLM) {
 	e.llms[a.Name()] = a
 	if e.defaultLLM == "" {
 		e.defaultLLM = a.Name()
+	}
+
+	// Inject scoped storage if the LLM plugin supports it.
+	if sa, ok := a.(StorageAware); ok && e.db != nil {
+		sa.SetStorage(NewScopedStoreProvider(e.db, "plugins/"+a.Name()))
+	}
+
+	// Update reflector's evaluator LLM if it's the first one or matches default
+	if e.reflector != nil {
+		if r, ok := e.reflector.(*SessionReflector); ok {
+			r.SetEvalLLM(a)
+		}
 	}
 }
 
@@ -145,7 +212,13 @@ func (e *Engine) LoadPlugins(cfg EngineConfig) error {
 	// 3. Load skill managers
 	e.skillManagerLimits = cfg.SkillManagerLimits
 	for _, smCfg := range cfg.SkillManagers {
-		sm, err := CreateSkillManager(smCfg.Type, smCfg.Options)
+		var storage KVStoreProvider
+		if e.db != nil {
+			// Scoped provider for this plugin
+			storage = NewScopedStoreProvider(e.db, "plugins/"+smCfg.Type)
+		}
+
+		sm, err := CreateSkillManager(smCfg.Type, smCfg.Options, storage)
 		if err != nil {
 			return err
 		}
@@ -202,7 +275,11 @@ func (e *Engine) AutoLoad() {
 
 	// 3. Auto-discover skill managers
 	for _, name := range ListSkillManagerFactories() {
-		if sm, err := CreateSkillManager(name, nil); err == nil {
+		var storage KVStoreProvider
+		if e.db != nil {
+			storage = NewScopedStoreProvider(e.db, "plugins/"+name)
+		}
+		if sm, err := CreateSkillManager(name, nil, storage); err == nil {
 			e.registerSkillManager(sm)
 		} else {
 			slog.Debug("skipped skill manager autoload", "name", name, "reason", err)
@@ -218,6 +295,14 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	if e.api != nil {
 		e.api.Start()
+	}
+	if e.sessionState != nil {
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			for range ticker.C {
+				_ = e.sessionState.CleanupExpired()
+			}
+		}()
 	}
 	for _, p := range e.dialogs {
 		if err := p.Start(e.handleMessage); err != nil {
@@ -242,11 +327,49 @@ func (e *Engine) HandleRelay(_ context.Context, _, _, _, _ string) (string, erro
 
 func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	ctx := context.Background()
+	startAt := time.Now()
+	traceID := GenerateTraceID()
+	interactionStatus := "completed"
+
+	// 0. Session State check & Escape Logic
+	if e.sessionState != nil {
+		state, err := e.sessionState.GetState(msg.SessionKey)
+		if err == nil && state != nil {
+			// Check Global Escape keywords
+			content := strings.ToLower(strings.TrimSpace(msg.Content))
+			if content == "exit" || content == "cancel" || content == "quit" || content == "退出" || content == "取消" {
+				_ = e.sessionState.ClearState(msg.SessionKey)
+				_ = p.Reply(ctx, msg.ReplyCtx, e.translator.T("session_released"))
+				return
+			}
+
+			// Logical Lock: Route to specific plugin
+			if state.LockedBy != "" {
+				// Based on design confirmed: "completely shield LLM".
+				// So we ONLY run pipes and then RETURN.
+				for _, pipe := range e.pipes {
+					if pipe.Handle(ctx, p, msg) {
+						return
+					}
+				}
+				// If no pipe handled it but state is locked, it's a "hanging" lock or invalid input.
+				_ = p.Reply(ctx, msg.ReplyCtx, e.translator.T("session_locked_wait", state.Action))
+				return
+			}
+		}
+	}
 
 	// 1. Run pipe pipeline (Dedup -> Safety -> Command)
 	for _, pipe := range e.pipes {
 		if pipe.Handle(ctx, p, msg) {
 			return // Intercepted
+		}
+	}
+
+	// Record incoming message in the Dialog plugin's own storage.
+	if recorder, ok := p.(DialogRecorder); ok {
+		if err := recorder.RecordMessage(traceID, msg); err != nil {
+			slog.Warn("engine: dialog record failed", "error", err, "trace_id", traceID)
 		}
 	}
 
@@ -257,6 +380,9 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 		return
 	}
 	defer session.Unlock()
+
+	// Record user message in history
+	session.AppendHistory(HistoryEntry{Role: RoleUser, Content: msg.Content})
 
 	// --- 权限处理逻辑开始 ---
 	pending := session.GetPendingAction()
@@ -309,8 +435,34 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 		_ = p.Reply(ctx, msg.ReplyCtx, "Error starting session: "+err.Error())
 		return
 	}
+
+	// Notify the LLM session about the current trace ID for self-recording.
+	if sr, ok := agSess.(SessionRecorder); ok {
+		sr.SetTraceID(traceID)
+	}
+
+	var usedSkillList []string
 	defer func() {
 		_ = agSess.Close()
+
+		// Record interaction index in Core.
+		if e.interactionLogger != nil {
+			e.interactionLogger.Record(InteractionRef{
+				TraceID:         traceID,
+				SessionKey:      msg.SessionKey,
+				Timestamp:       startAt.UnixMilli(),
+				SenderPlugin:    p.Name(),
+				ResponderPlugin: targetLLM.Name(),
+				UserID:          msg.UserID,
+				LatencyMs:       time.Since(startAt).Milliseconds(),
+				Status:          interactionStatus,
+			})
+		}
+
+		// Trigger Reflector for skill evaluation
+		if e.reflector != nil && interactionStatus == "completed" && len(usedSkillList) > 0 {
+			_ = e.reflector.Reflect(context.Background(), msg.SessionKey, traceID, usedSkillList)
+		}
 	}()
 
 	// 4.5 Inject skills if available
@@ -325,6 +477,9 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 
 	if len(allSkills) > 0 {
 		index := BuildSkillIndexPrompt(allSkills)
+		for _, s := range allSkills {
+			usedSkillList = append(usedSkillList, s.Name)
+		}
 		if pinj, ok := targetLLM.(PlatformPromptInjector); ok {
 			pinj.SetPlatformPrompt(AgentSystemPrompt() + index)
 		} else {
@@ -376,11 +531,13 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 			flushBuffer()
 			_ = p.Reply(ctx, msg.ReplyCtx, fmt.Sprintf("🛡️ 权限请求: %s 想执行 %s(%s)。\n\n回复“继续”允许。", ev.ToolName, ev.ToolName, ev.ToolInput))
 			session.SetPendingAction("confirm_tool:" + ev.ToolName)
+			interactionStatus = "interrupted"
 			return
 		case EventError:
 			flushBuffer()
 			slog.Error("engine: llm error", "error", ev.Error)
 			_ = p.Reply(ctx, msg.ReplyCtx, "❌ 出错了: "+ev.Error.Error())
+			interactionStatus = "error"
 		case EventResult:
 			flushBuffer()
 			if ev.SessionID != "" {
@@ -390,6 +547,9 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 				_ = p.Reply(ctx, msg.ReplyCtx, "❌ 错误: "+ev.Error.Error())
 			}
 			if ev.Done {
+				// Record assistant response in history
+				session.AppendHistory(HistoryEntry{Role: RoleAssistant, Content: textBuffer.String()})
+
 				// Autonomous Evolution: Trigger skill extraction at end of session
 				if len(e.skillManagers) > 0 {
 					go func() {

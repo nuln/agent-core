@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -31,14 +30,8 @@ func TestSession(t *testing.T) {
 }
 
 func TestSessionManager(t *testing.T) {
-	tmpFile, _ := os.CreateTemp("", "session-store-*.json")
-	tmpPath := tmpFile.Name()
-	_ = tmpFile.Close()
-	defer func() {
-		_ = os.Remove(tmpPath)
-	}()
-
-	sm := NewSessionManager(tmpPath)
+	kv := NewMockKVStore()
+	sm := NewSessionManager(kv)
 
 	s1 := sm.GetOrCreateActive("user1")
 	assert.NotNil(t, s1)

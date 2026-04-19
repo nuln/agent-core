@@ -3,8 +3,6 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -22,8 +20,9 @@ type sessionImpl struct {
 	PendingAction string `json:"pending_action,omitempty"`
 	PendingData   any    `json:"pending_data,omitempty"`
 
-	mu   sync.Mutex `json:"-"`
-	busy bool       `json:"-"`
+	mu   sync.Mutex      `json:"-"`
+	busy bool            `json:"-"`
+	sm   *SessionManager `json:"-"`
 }
 
 func (s *sessionImpl) GetID() string            { return s.ID }
@@ -33,6 +32,17 @@ func (s *sessionImpl) SetPendingAction(a string) {
 	defer s.mu.Unlock()
 	s.PendingAction = a
 }
+func (s *sessionImpl) GetHistory() []HistoryEntry { return s.History }
+func (s *sessionImpl) AppendHistory(entry HistoryEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.History = append(s.History, entry)
+	// Truncate history if it's too long (heuristic: 20 messages)
+	if len(s.History) > 20 {
+		s.History = s.History[len(s.History)-20:]
+	}
+}
+
 func (s *sessionImpl) GetMetadata() map[string]any { return s.Metadata }
 func (s *sessionImpl) SetMetadata(key string, val any) {
 	s.mu.Lock()
@@ -58,39 +68,55 @@ func (s *sessionImpl) Unlock() {
 	defer s.mu.Unlock()
 	s.busy = false
 	s.UpdatedAt = time.Now()
+	s.Save()
+}
+
+func (s *sessionImpl) Save() {
+	if s.sm == nil {
+		return
+	}
+	s.sm.saveSession(s)
 }
 
 // SessionManager supports multiple named sessions per user.
 type SessionManager struct {
-	mu            sync.RWMutex
-	sessions      map[string]*sessionImpl
-	activeSession map[string]string
-	userSessions  map[string][]string
-	storePath     string
+	mu     sync.RWMutex
+	kv     KVStore
+	active map[string]*sessionImpl
 }
 
-func NewSessionManager(storePath string) *SessionManager {
-	sm := &SessionManager{
-		sessions:      make(map[string]*sessionImpl),
-		activeSession: make(map[string]string),
-		userSessions:  make(map[string][]string),
-		storePath:     storePath,
+func NewSessionManager(kv KVStore) *SessionManager {
+	return &SessionManager{
+		kv:     kv,
+		active: make(map[string]*sessionImpl),
 	}
-	if storePath != "" {
-		sm.load()
-	}
-	return sm
 }
 
 func (sm *SessionManager) GetOrCreateActive(userKey string) Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if sid, ok := sm.activeSession[userKey]; ok {
-		if s, ok := sm.sessions[sid]; ok {
-			return s
+	// 1. Check in-memory active sessions
+	if s, ok := sm.active[userKey]; ok {
+		return s
+	}
+
+	// 2. Check active session ID for user from KV
+	data, _ := sm.kv.Get([]byte("a:" + userKey))
+	if data != nil {
+		sid := string(data)
+		// 3. Load session
+		sessData, _ := sm.kv.Get([]byte("s:" + sid))
+		if sessData != nil {
+			var s sessionImpl
+			if err := json.Unmarshal(sessData, &s); err == nil {
+				s.sm = sm // Inject manager
+				sm.active[userKey] = &s
+				return &s
+			}
 		}
 	}
+
 	return sm.createLocked(userKey, "default")
 }
 
@@ -102,48 +128,45 @@ func (sm *SessionManager) createLocked(userKey, name string) *sessionImpl {
 		Name:      name,
 		CreatedAt: now,
 		UpdatedAt: now,
+		sm:        sm, // Inject manager
 	}
-	sm.sessions[id] = s
-	sm.activeSession[userKey] = id
-	sm.userSessions[userKey] = append(sm.userSessions[userKey], id)
+
+	// Save session
+	sm.saveSession(s)
+
+	// Update in-memory active map
+	sm.active[userKey] = s
+
+	// Update active session
+	_ = sm.kv.Put([]byte("a:"+userKey), []byte(id))
+
+	// Update user sessions list
+	uKey := []byte("u:" + userKey)
+	var sids []string
+	if data, _ := sm.kv.Get(uKey); data != nil {
+		_ = json.Unmarshal(data, &sids)
+	}
+	sids = append(sids, id)
+	data, _ := json.Marshal(sids)
+	_ = sm.kv.Put(uKey, data)
+
 	return s
 }
 
+func (sm *SessionManager) saveSession(s *sessionImpl) {
+	data, _ := json.Marshal(s)
+	_ = sm.kv.Put([]byte("s:"+s.ID), data)
+}
+
 func (sm *SessionManager) Save() {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	if sm.storePath == "" {
-		return
-	}
-
-	persist := struct {
-		Sessions      map[string]*sessionImpl `json:"sessions"`
-		ActiveSession map[string]string       `json:"active_session"`
-		UserSessions  map[string][]string     `json:"user_sessions"`
-	}{
-		Sessions:      sm.sessions,
-		ActiveSession: sm.activeSession,
-		UserSessions:  sm.userSessions,
-	}
-
-	data, _ := json.MarshalIndent(persist, "", "  ")
-	_ = os.MkdirAll(filepath.Dir(sm.storePath), 0o755)
-	_ = AtomicWriteFile(sm.storePath, data, 0o644)
+	// In the new BoltDB implementation, we could save progressively.
+	// But since the engine often calls Save() explicitly (e.g. periodically),
+	// we keep it as a no-op if we already save on each change,
+	// or we use it as a trigger to sync if we had a cache.
 }
 
-func (sm *SessionManager) load() {
-	data, err := os.ReadFile(sm.storePath)
-	if err != nil {
-		return
-	}
-	persist := struct {
-		Sessions      map[string]*sessionImpl `json:"sessions"`
-		ActiveSession map[string]string       `json:"active_session"`
-		UserSessions  map[string][]string     `json:"user_sessions"`
-	}{}
-	if err := json.Unmarshal(data, &persist); err == nil {
-		sm.sessions = persist.Sessions
-		sm.activeSession = persist.ActiveSession
-		sm.userSessions = persist.UserSessions
-	}
-}
+// NOTE: sessionImpl needs to save itself back to the store when modified.
+// Currently the Engine calls Unlock() which updates UpdatedAt, but doesn't trigger a save.
+// I should probably update Unlock() to trigger a save via the manager,
+// but sessionImpl doesn't have a back-pointer to the manager.
+// I'll add a Save function to the Session interface or handle it in the Engine.

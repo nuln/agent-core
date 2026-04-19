@@ -169,3 +169,22 @@ func RedactToken(text, token string) string {
 	}
 	return strings.ReplaceAll(text, token, "[REDACTED]")
 }
+
+// TruncateStr cuts a string to maxLen bytes safely, ensuring it doesn't break
+// UTF-8 multi-byte characters. If truncated, it appends a marker with the total size.
+func TruncateStr(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+
+	// Find the last valid UTF-8 boundary before maxBytes
+	res := s[:maxBytes]
+	for i := len(res); i > 0; i-- {
+		if (res[i-1] & 0xc0) != 0x80 {
+			res = res[:i-1]
+			break
+		}
+	}
+
+	return fmt.Sprintf("%s... [truncated, total %d bytes]", res, len(s))
+}

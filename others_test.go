@@ -27,7 +27,7 @@ func TestRelay(t *testing.T) {
 		dialogs: make(map[string]Dialog),
 		llms:    make(map[string]LLM),
 	}
-	rm := NewRelayManager("", engine)
+	rm := NewRelayManager(nil, engine)
 	assert.NotNil(t, rm)
 	assert.Equal(t, engine, rm.engine)
 

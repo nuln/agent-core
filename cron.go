@@ -4,10 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -30,71 +27,64 @@ type CronJob struct {
 
 // CronStore persists cron jobs.
 type CronStore struct {
-	path string
-	mu   sync.Mutex
-	jobs []*CronJob
+	kv KVStore
 }
 
-func NewCronStore(dataDir string) (*CronStore, error) {
-	dir := filepath.Join(dataDir, "crons")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(dir, "jobs.json")
-	s := &CronStore{path: path}
-	s.load()
-	return s, nil
-}
-
-func (s *CronStore) load() {
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		return
-	}
-	if err := json.Unmarshal(data, &s.jobs); err != nil {
-		slog.Warn("cron: failed to unmarshal jobs", "error", err)
-	}
-}
-
-func (s *CronStore) save() error {
-	data, err := json.MarshalIndent(s.jobs, "", "  ")
-	if err != nil {
-		return fmt.Errorf("cron: marshal jobs: %w", err)
-	}
-	return AtomicWriteFile(s.path, data, 0o644)
+func NewCronStore(kv KVStore) (*CronStore, error) {
+	return &CronStore{kv: kv}, nil
 }
 
 func (s *CronStore) Add(job *CronJob) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.jobs = append(s.jobs, job)
-	return s.save()
+	data, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	return s.kv.Put([]byte(job.ID), data)
 }
 
 func (s *CronStore) List() []*CronJob {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]*CronJob, len(s.jobs))
-	copy(out, s.jobs)
-	return out
+	items, err := s.kv.List()
+	if err != nil {
+		slog.Error("cron: failed to list jobs", "error", err)
+		return nil
+	}
+
+	var jobs []*CronJob
+	for _, v := range items {
+		var j CronJob
+		if err := json.Unmarshal(v, &j); err == nil {
+			jobs = append(jobs, &j)
+		}
+	}
+	// Sort by ID for consistency? BoltDB List (ForEach) is sorted by key anyway.
+	return jobs
+}
+
+func (s *CronStore) Get(id string) *CronJob {
+	data, err := s.kv.Get([]byte(id))
+	if err != nil || data == nil {
+		return nil
+	}
+	var j CronJob
+	if err := json.Unmarshal(data, &j); err != nil {
+		return nil
+	}
+	return &j
 }
 
 func (s *CronStore) MarkRun(id string, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, j := range s.jobs {
-		if j.ID == id {
-			j.LastRun = time.Now()
-			if err != nil {
-				j.LastError = err.Error()
-			} else {
-				j.LastError = ""
-			}
-			if err := s.save(); err != nil {
-				slog.Warn("cron: failed to save job", "id", id, "error", err)
-			}
-			return
-		}
+	job := s.Get(id)
+	if job == nil {
+		return
+	}
+	job.LastRun = time.Now()
+	if err != nil {
+		job.LastError = err.Error()
+	} else {
+		job.LastError = ""
+	}
+	if err := s.Add(job); err != nil {
+		slog.Warn("cron: failed to save job", "id", id, "error", err)
 	}
 }
 
@@ -145,16 +135,8 @@ func (cs *CronScheduler) scheduleJob(job *CronJob) error {
 }
 
 func (cs *CronScheduler) executeJob(jobID string) {
-	cs.mu.Lock()
 	// Simplified execution: find job in store
-	var job *CronJob
-	for _, j := range cs.store.jobs {
-		if j.ID == jobID {
-			job = j
-			break
-		}
-	}
-	cs.mu.Unlock()
+	job := cs.store.Get(jobID)
 
 	if job == nil || !job.Enabled {
 		return

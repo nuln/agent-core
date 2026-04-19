@@ -422,6 +422,8 @@ const (
 	MsgWsCloneProgress   MsgKey = "ws_clone_progress"
 	MsgWsCloneSuccess    MsgKey = "ws_clone_success"
 	MsgWsCloneFailed     MsgKey = "ws_clone_failed"
+	MsgSessionReleased   MsgKey = "session_released"
+	MsgSessionLockedWait MsgKey = "session_locked_wait"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -1705,8 +1707,16 @@ var messages = map[MsgKey]map[Language]string{
 		LangChinese: "✅ 仓库克隆成功: `%s`",
 	},
 	MsgWsCloneFailed: {
-		LangEnglish: "❌ Failed to clone repository: %v",
-		LangChinese: "❌ 克隆仓库失败: %v",
+		LangEnglish: "❌ Clone failed: %v",
+		LangChinese: "❌ 克隆失败: %v",
+	},
+	MsgSessionReleased: {
+		LangEnglish: "🔓 Session lock released. LLM is now active.",
+		LangChinese: "🔓 会话锁定已解除，LLM 已重新接入。",
+	},
+	MsgSessionLockedWait: {
+		LangEnglish: "⏳ This session is locked for: %s. Reply 'exit' to cancel.",
+		LangChinese: "⏳ 当前会话正被锁定用于: %s。回复“取消”可退出。",
 	},
 }
 

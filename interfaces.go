@@ -61,12 +61,46 @@ type Session interface {
 	SetMetadata(key string, value any) // Sets a metadata value
 	TryLock() bool                     // Attempt to lock the session for exclusive processing
 	Unlock()                           // Release the session lock
+	Save()                             // Explicitly persist the session state
+	GetHistory() []HistoryEntry        // Returns the conversation history
+	AppendHistory(entry HistoryEntry)  // Appends a new entry to the history
+}
+
+// SessionState stores a persistent logical stage of a conversation.
+type SessionState struct {
+	SessionKey  string                 `json:"session_key"`
+	Stage       string                 `json:"stage"`      // e.g. "WAIT_PAYMENT"
+	Action      string                 `json:"action"`     // description
+	ContextVars map[string]interface{} `json:"vars"`       // temp data
+	LockedBy    string                 `json:"locked_by"`  // pipe name that owns this state
+	ExpiresAt   int64                  `json:"expires_at"` // unix milli
+}
+
+// SessionStateManager manages persistent session states.
+type SessionStateManager interface {
+	GetState(sessionKey string) (*SessionState, error)
+	SetState(sessionKey string, state *SessionState) error
+	ClearState(sessionKey string) error
+	CleanupExpired() error
 }
 
 // SessionProvider provides session management and retrieval.
 type SessionProvider interface {
 	// GetOrCreateActive returns the active session for a given user key, creating one if none exists.
 	GetOrCreateActive(key string) Session
+}
+
+// KVStore defines a generic persistent key-value store.
+type KVStore interface {
+	Get(key []byte) ([]byte, error)
+	Put(key, value []byte) error
+	Delete(key []byte) error
+	List() (map[string][]byte, error)
+}
+
+// KVStoreProvider provides access to named KVStores.
+type KVStoreProvider interface {
+	GetStore(name string) (KVStore, error)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -231,7 +265,9 @@ type PipeContext struct {
 	// Inject allows a pipe to synthesize an inbound message into a session (e.g. webhook/heartbeat).
 	// When called, the engine routes the content through the full pipe-and-LLM pipeline
 	// as if it were a real user message for the given sessionKey.
-	Inject func(ctx context.Context, sessionKey, content string)
+	Inject  func(ctx context.Context, sessionKey, content string)
+	Storage KVStoreProvider     // Persistent storage provider for the pipe
+	State   SessionStateManager // Persistent session state manager
 }
 
 // PipeFactory creates a Pipe instance.
@@ -305,6 +341,12 @@ type HistoryEntry struct {
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
 }
+
+const (
+	RoleUser      = "user"
+	RoleAssistant = "assistant"
+	RoleSystem    = "system"
+)
 
 // ──────────────────────────────────────────────────────────────
 // Extended Dialog (Platform) Interfaces
@@ -498,14 +540,17 @@ type ModeSwitcher interface {
 
 // SkillManager defines how agent skills are persisted and discovered.
 type SkillManager interface {
-	Name() string                                                    // Unique name of the manager implementation
-	Type() string                                                    // Type of the manager (e.g., "skill", "memory")
-	Description() string                                             // Short description of the manager
-	List(ctx context.Context) ([]*Skill, error)                      // List all available skills
-	Get(ctx context.Context, name string) (*Skill, error)            // Get a specific skill by name
-	Save(ctx context.Context, s *Skill) error                        // Create or update a skill
-	Delete(ctx context.Context, name string) error                   // Delete a skill
+	Name() string                                                                   // Unique name of the manager implementation
+	Type() string                                                                   // Type of the manager (e.g., "skill", "memory")
+	Description() string                                                            // Short description of the manager
+	List(ctx context.Context) ([]*Skill, error)                                     // List all available skills
+	Get(ctx context.Context, name string) (*Skill, error)                           // Get a specific skill by name
+	Save(ctx context.Context, s *Skill) error                                       // Create or update a skill
+	Delete(ctx context.Context, name string) error                                  // Delete a skill
 	Extract(ctx context.Context, llm LLM, history []HistoryEntry) ([]*Skill, error) // Analyze history and propose new skills
+
+	// RecordExecution (Optional) records the outcome of a skill usage.
+	RecordExecution(skillName string, score int) error
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -568,4 +613,37 @@ type WorkspaceBindingProvider interface {
 	SetWorkspaceBinding(sessionKey, workspacePath string) error
 	// ClearWorkspaceBinding removes the binding for a session key.
 	ClearWorkspaceBinding(sessionKey string) error
+}
+
+// ──────────────────────────────────────────────────────────────
+// Interaction Logging (Distributed)
+// ──────────────────────────────────────────────────────────────
+
+// StorageAware is an optional interface for Dialog and LLM plugins that need
+// persistent storage. The Engine injects a scoped KVStoreProvider during
+// plugin registration, giving each plugin its own isolated bucket namespace.
+type StorageAware interface {
+	SetStorage(store KVStoreProvider)
+}
+
+// DialogRecorder is an optional interface for Dialog plugins that can record
+// incoming messages in their own format and storage. Each Dialog plugin
+// defines its OWN log data structure internally; Core never inspects it.
+type DialogRecorder interface {
+	RecordMessage(traceID string, msg *Message) error
+}
+
+// SessionRecorder is an optional interface for AgentSession implementations
+// that can record the LLM's side of an interaction. By calling SetTraceID
+// before Send, the session knows which interaction it belongs to and can
+// internally record thinking, tool calls, and responses in its own format.
+// The session finalizes its log entry when Close() is called.
+type SessionRecorder interface {
+	SetTraceID(traceID string)
+}
+
+// Reflector is responsible for post-session evaluation of AI performance.
+type Reflector interface {
+	// Reflect evaluates a session's outcome and updates skill/agent metrics.
+	Reflect(ctx context.Context, sessionKey, traceID string, usedSkills []string) error
 }

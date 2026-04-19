@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"os"
 	"testing"
 	"time"
 
@@ -9,12 +8,8 @@ import (
 )
 
 func TestCronStore(t *testing.T) {
-	tmpDir := t.TempDir()
-	defer func() {
-		_ = os.RemoveAll(tmpDir)
-	}()
-
-	store, err := NewCronStore(tmpDir)
+	kv := NewMockKVStore()
+	store, err := NewCronStore(kv)
 	assert.NoError(t, err)
 
 	job := &CronJob{

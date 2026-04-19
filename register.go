@@ -155,13 +155,19 @@ func ListSkillManagerFactories() []string {
 }
 
 // CreateSkillManager instantiates a SkillManager by its registered name.
-func CreateSkillManager(name string, opts map[string]any) (SkillManager, error) {
+func CreateSkillManager(name string, opts map[string]any, storage KVStoreProvider) (SkillManager, error) {
 	skillManagerMu.RLock()
 	factory, ok := skillManagerFactories[name]
 	skillManagerMu.RUnlock()
 
 	if !ok {
 		return nil, fmt.Errorf("unknown skill manager provider %q", name)
+	}
+	if storage != nil {
+		if opts == nil {
+			opts = make(map[string]any)
+		}
+		opts["_storage"] = storage
 	}
 	return factory(opts)
 }
