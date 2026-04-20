@@ -37,6 +37,10 @@ type ConfigField struct {
 	// Key is the opts map key (e.g. "app_id") used in config files.
 	Key string
 
+	// Label is a short human-readable display name for the field.
+	// If empty, the Key is used as a fallback.
+	Label string
+
 	// Description is a human-readable description.
 	Description string
 
@@ -56,6 +60,21 @@ type ConfigField struct {
 	Example string
 }
 
+// AuthType describes how a dialog plugin authenticates new accounts.
+type AuthType string
+
+const (
+	// AuthTypeNone means no authentication flow is needed (the plugin is
+	// fully configured via fields alone).
+	AuthTypeNone AuthType = ""
+	// AuthTypeQR means the plugin uses a QR-code scan to add accounts
+	// (e.g. Weixin). Clients should launch the QR flow when enabling.
+	AuthTypeQR AuthType = "qr"
+	// AuthTypeToken means the plugin authenticates by submitting a token/key
+	// provided by the user (e.g. Telegram bot token, Lark app secret).
+	AuthTypeToken AuthType = "token"
+)
+
 // PluginConfigSpec describes the full configuration surface of a plugin.
 type PluginConfigSpec struct {
 	// PluginName matches the registration name (e.g. "lark", "ratelimiter").
@@ -66,6 +85,10 @@ type PluginConfigSpec struct {
 
 	// Description is a human-readable description of the plugin.
 	Description string
+
+	// AuthType describes how the plugin adds user accounts.
+	// Only relevant for dialog plugins.
+	AuthType AuthType
 
 	// Fields is the ordered list of configuration fields.
 	Fields []ConfigField
@@ -356,6 +379,18 @@ func listSpecsForNames(names []string) []PluginConfigSpec {
 func hasEnvFields(spec PluginConfigSpec) bool {
 	for _, f := range spec.Fields {
 		if f.EnvVar != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// anyEnvVarSet returns true if at least one of the spec's env-var fields is
+// actually populated in the current process environment. Used to decide
+// whether to auto-load an LLM plugin.
+func anyEnvVarSet(spec PluginConfigSpec) bool {
+	for _, f := range spec.Fields {
+		if f.EnvVar != "" && os.Getenv(f.EnvVar) != "" {
 			return true
 		}
 	}

@@ -46,6 +46,9 @@ type Engine struct {
 	interactionLogger  *InteractionLogger
 	sessionState       SessionStateManager
 	reflector          Reflector
+	uiAbilities        map[string]UIAbility
+	instanceStore      *PluginInstanceStore
+	started            bool // true after Start() has been called
 	mu                 sync.RWMutex
 }
 
@@ -57,6 +60,7 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 		tts:                tts,
 		dialogs:            make(map[string]Dialog),
 		llms:               make(map[string]LLM),
+		uiAbilities:        make(map[string]UIAbility),
 		skillManagerLimits: make(map[string]int),
 		loadedSkillTypes:   make(map[string]int),
 	}
@@ -97,6 +101,10 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 
 		// Reflector
 		e.reflector = NewSessionReflector(e.sessions, nil, e.skillManagers)
+
+		// Plugin instance store (persists dialog/llm configs across restarts)
+		instKV, _ := NewBoltStore(e.db, "_core/plugin_instances")
+		e.instanceStore = NewPluginInstanceStore(instKV)
 	}
 
 	var storage KVStoreProvider
@@ -163,6 +171,11 @@ func (e *Engine) RegisterDialog(p Dialog) {
 	if sa, ok := p.(StorageAware); ok && e.db != nil {
 		sa.SetStorage(NewScopedStoreProvider(e.db, "plugins/"+p.Name()))
 	}
+
+	// Register UI abilities if supported
+	if wp, ok := p.(WebProvider); ok {
+		e.uiAbilities[p.Name()] = wp.GetUIAbility()
+	}
 }
 
 func (e *Engine) RegisterLLM(a LLM) {
@@ -176,6 +189,11 @@ func (e *Engine) RegisterLLM(a LLM) {
 	// Inject scoped storage if the LLM plugin supports it.
 	if sa, ok := a.(StorageAware); ok && e.db != nil {
 		sa.SetStorage(NewScopedStoreProvider(e.db, "plugins/"+a.Name()))
+	}
+
+	// Register UI abilities if supported
+	if wp, ok := a.(WebProvider); ok {
+		e.uiAbilities[a.Name()] = wp.GetUIAbility()
 	}
 
 	// Update reflector's evaluator LLM if it's the first one or matches default
@@ -249,22 +267,29 @@ func (e *Engine) registerSkillManager(sm SkillManager) {
 
 	e.skillManagers = append(e.skillManagers, sm)
 	e.loadedSkillTypes[smType]++
+
+	// Register UI abilities if supported
+	if wp, ok := sm.(WebProvider); ok {
+		e.uiAbilities[sm.Name()] = wp.GetUIAbility()
+	}
+
 	slog.Info("loaded skill manager", "name", sm.Name(), "type", smType, "count", e.loadedSkillTypes[smType], "limit", limit)
 }
 
+// AutoLoad auto-discovers and loads LLM providers and skill managers based on
+// available binaries / environment variables. Dialog plugins are intentionally
+// excluded: they must be explicitly enabled by the operator via the UI (or
+// pre-seeded in the database) so that no QR-code or network connection is
+// opened without deliberate configuration.
 func (e *Engine) AutoLoad() {
-	// 1. Auto-discover dialogs
-	for _, name := range ListDialogFactories() {
-		if p, err := CreateDialog(name, nil); err == nil {
-			e.RegisterDialog(p)
-			slog.Info("auto-loaded dialog", "name", name)
-		} else {
-			slog.Debug("skipped dialog autoload", "name", name, "reason", err)
-		}
-	}
-
-	// 2. Auto-discover llms
+	// Auto-discover LLMs — only load if at least one env-var field is populated.
+	// This prevents loading LLMs whose API keys have not been configured yet.
 	for _, name := range ListLLMFactories() {
+		spec, ok := GetPluginConfigSpec(name)
+		if ok && !anyEnvVarSet(spec) {
+			slog.Debug("skipped llm autoload: no env vars configured", "name", name)
+			continue
+		}
 		if a, err := CreateLLM(name, nil); err == nil {
 			e.RegisterLLM(a)
 			slog.Info("auto-loaded llm", "name", name)
@@ -273,7 +298,7 @@ func (e *Engine) AutoLoad() {
 		}
 	}
 
-	// 3. Auto-discover skill managers
+	// Auto-discover skill managers
 	for _, name := range ListSkillManagerFactories() {
 		var storage KVStoreProvider
 		if e.db != nil {
@@ -285,6 +310,117 @@ func (e *Engine) AutoLoad() {
 			slog.Debug("skipped skill manager autoload", "name", name, "reason", err)
 		}
 	}
+}
+
+// LoadSavedInstances restores all enabled plugin instances that were previously
+// persisted via EnablePlugin. It must be called before Start().
+func (e *Engine) LoadSavedInstances() {
+	if e.instanceStore == nil {
+		return
+	}
+	instances, err := e.instanceStore.List()
+	if err != nil {
+		slog.Error("engine: failed to load plugin instances", "error", err)
+		return
+	}
+	for _, inst := range instances {
+		if !inst.Enabled {
+			continue
+		}
+		switch inst.Category {
+		case "dialog":
+			d, err := CreateDialog(inst.PluginName, inst.Config)
+			if err != nil {
+				slog.Error("engine: failed to restore dialog instance", "name", inst.PluginName, "error", err)
+				continue
+			}
+			e.RegisterDialog(d)
+			slog.Info("engine: restored dialog instance", "name", inst.PluginName)
+		}
+	}
+}
+
+// EnablePlugin creates a dialog plugin from pluginName+config, persists the
+// configuration, registers it, and starts it if the engine is already running.
+// Each call for the same pluginName replaces any previously stored config.
+func (e *Engine) EnablePlugin(pluginName string, config map[string]any) error {
+	d, err := CreateDialog(pluginName, config)
+	if err != nil {
+		return fmt.Errorf("engine: failed to create plugin %q: %w", pluginName, err)
+	}
+
+	// Persist the configuration so it survives restarts.
+	if e.instanceStore != nil {
+		// Preserve CreatedAt from an existing record if present.
+		existing, _ := e.instanceStore.Get(pluginName)
+		inst := PluginInstance{
+			ID:         pluginName,
+			PluginName: pluginName,
+			Category:   "dialog",
+			Label:      pluginName,
+			Config:     config,
+			Enabled:    true,
+		}
+		if existing != nil {
+			inst.CreatedAt = existing.CreatedAt
+		}
+		if err := e.instanceStore.Save(inst); err != nil {
+			slog.Warn("engine: failed to persist plugin instance", "name", pluginName, "error", err)
+		}
+	}
+
+	// If an old instance of this plugin is running, stop it first.
+	e.mu.Lock()
+	old, exists := e.dialogs[pluginName]
+	e.mu.Unlock()
+	if exists {
+		_ = old.Stop()
+	}
+
+	e.RegisterDialog(d)
+
+	// If engine.Start() has already been called, start the dialog immediately.
+	e.mu.RLock()
+	alreadyStarted := e.started
+	e.mu.RUnlock()
+	if alreadyStarted {
+		return d.Start(e.handleMessage)
+	}
+	return nil
+}
+
+// DisablePlugin stops a running dialog plugin and marks it disabled in the store.
+// Disabled instances are not restored on the next startup.
+func (e *Engine) DisablePlugin(pluginName string) error {
+	e.mu.Lock()
+	d, ok := e.dialogs[pluginName]
+	if ok {
+		delete(e.dialogs, pluginName)
+		delete(e.uiAbilities, pluginName)
+	}
+	e.mu.Unlock()
+
+	// Mark disabled in the persistent store.
+	if e.instanceStore != nil {
+		inst, _ := e.instanceStore.Get(pluginName)
+		if inst != nil {
+			inst.Enabled = false
+			_ = e.instanceStore.Save(*inst)
+		}
+	}
+
+	if ok {
+		return d.Stop()
+	}
+	return nil
+}
+
+// GetPluginInstances returns all persisted plugin instances.
+func (e *Engine) GetPluginInstances() ([]PluginInstance, error) {
+	if e.instanceStore == nil {
+		return nil, nil
+	}
+	return e.instanceStore.List()
 }
 
 func (e *Engine) Start(ctx context.Context) error {
@@ -304,6 +440,11 @@ func (e *Engine) Start(ctx context.Context) error {
 			}
 		}()
 	}
+
+	e.mu.Lock()
+	e.started = true
+	e.mu.Unlock()
+
 	for _, p := range e.dialogs {
 		if err := p.Start(e.handleMessage); err != nil {
 			return err
@@ -323,6 +464,136 @@ func (e *Engine) HandleCron(_ *CronJob) error {
 func (e *Engine) HandleRelay(_ context.Context, _, _, _, _ string) (string, error) {
 	// Logic to handle inter-bot communication
 	return "relay ok", nil
+}
+
+func (e *Engine) GetUIManifest() map[string]UIAbility {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	// Return a copy to avoid mutation
+	m := make(map[string]UIAbility)
+	for k, v := range e.uiAbilities {
+		m[k] = v
+	}
+	return m
+}
+
+// EngineStatus describes the full internal state of the engine.
+type EngineStatus struct {
+	Dialogs []ComponentInfo `json:"dialogs"`
+	LLMs    []ComponentInfo `json:"llms"`
+	Skills  []SkillInfo     `json:"skills"`
+}
+
+type ComponentInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type SkillInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Manager     string `json:"manager"`
+}
+
+// GetStatus returns the current inventory of loaded components.
+func (e *Engine) GetStatus(ctx context.Context) EngineStatus {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	status := EngineStatus{}
+
+	for _, d := range e.dialogs {
+		status.Dialogs = append(status.Dialogs, ComponentInfo{
+			Name:        d.Name(),
+			Description: "", // Dialog interface doesn't have Description() currently
+		})
+	}
+
+	for _, l := range e.llms {
+		status.LLMs = append(status.LLMs, ComponentInfo{
+			Name:        l.Name(),
+			Description: l.Description(),
+		})
+	}
+
+	for _, sm := range e.skillManagers {
+		skills, err := sm.List(ctx)
+		if err == nil {
+			for _, s := range skills {
+				status.Skills = append(status.Skills, SkillInfo{
+					Name:        s.Name,
+					Description: s.Description,
+					Manager:     sm.Name(),
+				})
+			}
+		}
+	}
+
+	return status
+}
+
+// GetDialogInstances returns the health status of all registered bot instances across all platforms.
+func (e *Engine) GetDialogInstances() map[string][]DialogInstanceStatus {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	results := make(map[string][]DialogInstanceStatus)
+	for name, d := range e.dialogs {
+		if md, ok := d.(ManageableDialog); ok {
+			results[name] = md.GetInstances()
+		} else {
+			// Legacy fallback for non-manageable dialogs
+			results[name] = []DialogInstanceStatus{
+				{ID: "default", Status: "connected", Description: "Static platform"},
+			}
+		}
+	}
+	return results
+}
+
+// StartDialogAuth begins an interactive login session for a specific platform.
+func (e *Engine) StartDialogAuth(ctx context.Context, platform string) (*AuthSession, error) {
+	e.mu.RLock()
+	d, ok := e.dialogs[platform]
+	e.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("platform %q not found", platform)
+	}
+	md, ok := d.(ManageableDialog)
+	if !ok {
+		return nil, fmt.Errorf("platform %q does not support interactive auth", platform)
+	}
+	return md.StartAuth(ctx)
+}
+
+// PollDialogAuth checks the status of an ongoing login session.
+func (e *Engine) PollDialogAuth(ctx context.Context, platform, sessionID string) (*AuthSession, error) {
+	e.mu.RLock()
+	d, ok := e.dialogs[platform]
+	e.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("platform %q not found", platform)
+	}
+	md, ok := d.(ManageableDialog)
+	if !ok {
+		return nil, fmt.Errorf("platform %q does not support interactive auth", platform)
+	}
+	return md.PollAuth(ctx, sessionID)
+}
+
+// AddDialogInstance adds a new bot instance using provided parameters (tokens/secrets).
+func (e *Engine) AddDialogInstance(ctx context.Context, platform string, params map[string]string) error {
+	e.mu.RLock()
+	d, ok := e.dialogs[platform]
+	e.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("platform %q not found", platform)
+	}
+	md, ok := d.(ManageableDialog)
+	if !ok {
+		return fmt.Errorf("platform %q does not support manual instance addition", platform)
+	}
+	return md.AddInstance(ctx, params)
 }
 
 func (e *Engine) handleMessage(p Dialog, msg *Message) {

@@ -117,6 +117,31 @@ type Dialog interface {
 	Reload(opts map[string]any) error                              // Reloads platform configuration
 }
 
+// DialogInstanceStatus describes the health and identity of a single bot instance.
+type DialogInstanceStatus struct {
+	ID          string `json:"id"`
+	Status      string `json:"status"` // "connected", "error", "starting", "unauthorized"
+	InboundAt   int64  `json:"inbound_at"`
+	Description string `json:"description"`
+}
+
+// AuthSession represents an active interactive login attempt (e.g., scanning a QR code).
+type AuthSession struct {
+	ID      string `json:"id"`
+	QRUrl   string `json:"qr_url,omitempty"`
+	Status  string `json:"status"` // "waiting", "scanned", "confirmed", "expired"
+	Message string `json:"message,omitempty"`
+}
+
+// ManageableDialog is implemented by platforms that support multiple bots and interactive login.
+type ManageableDialog interface {
+	Dialog
+	GetInstances() []DialogInstanceStatus
+	StartAuth(ctx context.Context) (*AuthSession, error)
+	PollAuth(ctx context.Context, sessionID string) (*AuthSession, error)
+	AddInstance(ctx context.Context, params map[string]string) error
+}
+
 // MessageHandler is the callback function invoked when a new message arrives from a Dialog platform.
 type MessageHandler func(p Dialog, msg *Message)
 
@@ -640,6 +665,29 @@ type DialogRecorder interface {
 // The session finalizes its log entry when Close() is called.
 type SessionRecorder interface {
 	SetTraceID(traceID string)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Web & UI Extension Interfaces
+// ──────────────────────────────────────────────────────────────
+
+// WebRoute describes a single frontend route provided by a plugin.
+type WebRoute struct {
+	Path  string `json:"path"`  // Relative path (e.g., "/memory")
+	Label string `json:"label"` // Human-readable menu label
+	Icon  string `json:"icon"`  // Lucide icon identifier
+	Entry string `json:"entry"` // Path to the frontend entry file (relative to www/)
+}
+
+// UIAbility describes the unified web capabilities of a plugin.
+type UIAbility struct {
+	Routes []WebRoute `json:"routes"` // List of pages provided by the plugin
+}
+
+// WebProvider is implemented by plugins that contribute UI pages to the Core Shell.
+type WebProvider interface {
+	GetUIAbility() UIAbility // Returns metadata for UI discovery
+	GetWWWDir() string       // Returns the physical path to the plugin's 'www' directory
 }
 
 // Reflector is responsible for post-session evaluation of AI performance.
