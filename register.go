@@ -302,6 +302,17 @@ func CreateEventBus(name string, opts map[string]any) (EventBus, error) {
 	return factory(opts)
 }
 
+// ListEventBusFactories returns the names of all registered EventBus factories.
+func ListEventBusFactories() []string {
+	eventBusMu.RLock()
+	defer eventBusMu.RUnlock()
+	names := make([]string, 0, len(eventBusFactories))
+	for n := range eventBusFactories {
+		names = append(names, n)
+	}
+	return names
+}
+
 // ──────────────────────────────────────────────────────────────
 // PolicyEngine Registry
 // ──────────────────────────────────────────────────────────────
@@ -327,4 +338,15 @@ func CreatePolicyEngine(name string, opts map[string]any) (PolicyEngine, error) 
 		return nil, fmt.Errorf("unknown policy engine %q", name)
 	}
 	return factory(opts)
+}
+
+// ListPolicyEngineFactories returns the names of all registered PolicyEngine factories.
+func ListPolicyEngineFactories() []string {
+	policyMu.RLock()
+	defer policyMu.RUnlock()
+	names := make([]string, 0, len(policyFactories))
+	for n := range policyFactories {
+		names = append(names, n)
+	}
+	return names
 }

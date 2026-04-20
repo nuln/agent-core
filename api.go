@@ -64,6 +64,7 @@ func NewAPIServer(dataDir string, engine *Engine) (*APIServer, error) {
 	s.mux.HandleFunc("/api/v1/plugins/enable", s.handlePluginEnable)
 	s.mux.HandleFunc("/api/v1/plugins/disable", s.handlePluginDisable)
 	s.mux.HandleFunc("/api/v1/plugins/instances", s.handlePluginInstances)
+	s.mux.HandleFunc("/api/v1/capabilities", s.handleCapabilities)
 
 	// Static Assets (Embedded Core Shell)
 	staticFS := GetStaticFS()
@@ -312,6 +313,32 @@ func (s *APIServer) handlePluginEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "name": req.Name})
+}
+
+// handleCapabilities lists all registered plugin types and their factories.
+func (s *APIServer) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	type capList struct {
+		Dialogs       []string `json:"dialogs"`
+		LLMs          []string `json:"llms"`
+		SkillManagers []string `json:"skill_managers"`
+		Storage       []string `json:"storage"`
+		Triggers      []string `json:"triggers"`
+		EventBuses    []string `json:"event_buses"`
+		PolicyEngines []string `json:"policy_engines"`
+	}
+	caps := capList{
+		Dialogs:       ListDialogFactories(),
+		LLMs:          ListLLMFactories(),
+		SkillManagers: ListSkillManagerFactories(),
+		Storage:       ListStorageFactories(),
+		Triggers:      ListTriggerFactories(),
+		EventBuses:    ListEventBusFactories(),
+		PolicyEngines: ListPolicyEngineFactories(),
+	}
+	_ = json.NewEncoder(w).Encode(caps)
 }
 
 // handlePluginDisable stops a running dialog plugin and marks it disabled.
