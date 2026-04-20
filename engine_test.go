@@ -28,13 +28,13 @@ func TestEngine_Initialization(t *testing.T) {
 	tp := &mockTranslator{}
 	sp := &mockSessionProvider{}
 
-	e := NewEngine(sp, tp, nil, nil, tmpDir)
+	e := NewEngine(WithSessions(sp), WithTranslator(tp), WithDataDir(tmpDir))
 	assert.NotNil(t, e)
 	assert.NotNil(t, e.pipes)
 }
 
 func TestEngine_Registration(t *testing.T) {
-	e := NewEngine(nil, nil, nil, nil, "")
+	e := NewEngine()
 
 	dialog := &mockDialog{name: "d1"}
 	e.RegisterDialog(dialog)

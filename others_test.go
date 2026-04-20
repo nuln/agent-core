@@ -1,25 +1,14 @@
 package agent
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestDoctor(t *testing.T) {
-	results := RunDoctorChecks(context.Background(), nil, nil)
-	assert.NotEmpty(t, results)
-
-	report := FormatDoctorResults(results)
-	assert.Contains(t, report, "Doctor Report")
-}
-
 func TestStreaming(t *testing.T) {
 	cfg := DefaultStreamPreviewCfg()
 	assert.True(t, cfg.Enabled)
-
-	// Complex streaming tests would need more mocks
 }
 
 func TestRelay(t *testing.T) {

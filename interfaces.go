@@ -868,3 +868,73 @@ type PolicyEngine interface {
 
 // PolicyEngineFactory creates a PolicyEngine from options.
 type PolicyEngineFactory func(opts map[string]any) (PolicyEngine, error)
+
+// ──────────────────────────────────────────────────────────────
+// Engine Option Pattern
+// ──────────────────────────────────────────────────────────────
+
+// EngineOption configures the Engine during construction.
+type EngineOption func(*EngineOptions)
+
+// EngineOptions holds all injectable dependencies for the Engine.
+type EngineOptions struct {
+	Sessions   SessionProvider
+	Store      KVStoreProvider
+	Storage    StorageBackend
+	Translator Translator
+	STT        SpeechToText
+	TTS        TextToSpeech
+	Reflector  Reflector
+	EventBus   EventBus
+	DataDir    string
+}
+
+// WithSessions injects a SessionProvider.
+func WithSessions(sp SessionProvider) EngineOption {
+	return func(o *EngineOptions) { o.Sessions = sp }
+}
+
+// WithStore injects a KVStoreProvider.
+func WithStore(kv interface{}) EngineOption {
+	return func(o *EngineOptions) {
+		if kvp, ok := kv.(KVStoreProvider); ok {
+			o.Store = kvp
+		}
+		if sb, ok := kv.(StorageBackend); ok {
+			o.Storage = sb
+		}
+	}
+}
+
+// WithTranslator injects a Translator.
+func WithTranslator(t Translator) EngineOption {
+	return func(o *EngineOptions) { o.Translator = t }
+}
+
+// WithSTT injects a SpeechToText provider.
+func WithSTT(stt SpeechToText) EngineOption {
+	return func(o *EngineOptions) { o.STT = stt }
+}
+
+// WithTTS injects a TextToSpeech provider.
+func WithTTS(tts TextToSpeech) EngineOption {
+	return func(o *EngineOptions) { o.TTS = tts }
+}
+
+// WithReflector injects a Reflector.
+func WithReflector(r Reflector) EngineOption {
+	return func(o *EngineOptions) { o.Reflector = r }
+}
+
+// WithEventBus injects an EventBus.
+func WithEventBus(eb EventBus) EngineOption {
+	return func(o *EngineOptions) { o.EventBus = eb }
+}
+
+// WithDataDir sets the data directory.
+func WithDataDir(dir string) EngineOption {
+	return func(o *EngineOptions) { o.DataDir = dir }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Note: SpeechToText and TextToSpeech interfaces are defined in voice.go

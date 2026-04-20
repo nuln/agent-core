@@ -4,13 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"go.etcd.io/bbolt"
 )
 
 type PluginConfig struct {
@@ -26,15 +22,13 @@ type EngineConfig struct {
 	DefaultLLM         string         `json:"default_llm"`
 }
 
-// Engine routes messages between platforms and
+// Engine routes messages between Dialog platforms and LLM providers.
 type Engine struct {
 	dialogs            map[string]Dialog
 	llms               map[string]LLM
 	skillManagers      []SkillManager
 	sessions           SessionProvider
 	translator         Translator
-	cron               *CronScheduler
-	relay              *RelayManager
 	stt                SpeechToText
 	tts                TextToSpeech
 	api                *APIServer
@@ -42,22 +36,34 @@ type Engine struct {
 	defaultLLM         string
 	skillManagerLimits map[string]int
 	loadedSkillTypes   map[string]int
-	db                 *bbolt.DB
+	store              KVStoreProvider
 	interactionLogger  *InteractionLogger
 	sessionState       SessionStateManager
 	reflector          Reflector
+	relay              *RelayManager
 	uiAbilities        map[string]UIAbility
 	instanceStore      *PluginInstanceStore
-	started            bool // true after Start() has been called
+	dataDir            string
+	started            bool
 	mu                 sync.RWMutex
 }
 
-func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts TextToSpeech, dataDir string) *Engine {
+// NewEngine creates a new Engine with the given options.
+// Dependencies are injected via EngineOption functions.
+func NewEngine(opts ...EngineOption) *Engine {
+	options := &EngineOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	e := &Engine{
-		sessions:           sessions,
-		translator:         t,
-		stt:                stt,
-		tts:                tts,
+		sessions:           options.Sessions,
+		translator:         options.Translator,
+		stt:                options.STT,
+		tts:                options.TTS,
+		store:              options.Store,
+		reflector:          options.Reflector,
+		dataDir:            options.DataDir,
 		dialogs:            make(map[string]Dialog),
 		llms:               make(map[string]LLM),
 		uiAbilities:        make(map[string]UIAbility),
@@ -65,56 +71,51 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 		loadedSkillTypes:   make(map[string]int),
 	}
 
-	var db *bbolt.DB
-	if dataDir != "" {
-		dbPath := filepath.Join(dataDir, "agent.db")
-		_ = os.MkdirAll(dataDir, 0o755)
-		var err error
-		db, err = bbolt.Open(dbPath, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
-		if err != nil {
-			slog.Error("engine: failed to open boltdb", "path", dbPath, "error", err)
-		} else {
-			e.db = db
-		}
+	// Default translator if none provided
+	if e.translator == nil {
+		e.translator = &noopTranslator{}
 	}
 
-	// Initialize Core Stores
-	if e.db != nil {
+	// Initialize internal stores from KVStoreProvider
+	if e.store != nil {
 		// SessionManager (if not provided)
 		if e.sessions == nil {
-			sessKV, _ := NewBoltStore(e.db, "_core/sessions")
-			e.sessions = NewSessionManager(sessKV)
+			sessKV, _ := e.store.GetStore("_core/sessions")
+			if sessKV != nil {
+				e.sessions = NewSessionManager(sessKV)
+			}
 		}
 
-		// Cron Store
-		cronKV, _ := NewBoltStore(e.db, "_core/crons")
-		cStore, _ := NewCronStore(cronKV)
-		e.cron = NewCronScheduler(cStore, e)
+		// Interaction logger
+		logStore, _ := e.store.GetStore("_core/interactions")
+		if logStore != nil {
+			e.interactionLogger = NewInteractionLogger(logStore)
+		}
 
-		// Interaction logger for tracing Dialog<->LLM interactions
-		logStore, _ := NewBoltStore(e.db, "_core/interactions")
-		e.interactionLogger = NewInteractionLogger(logStore)
+		// Session state manager
+		stateKV, _ := e.store.GetStore("_core/session_states")
+		if stateKV != nil {
+			e.sessionState = NewSessionStateManager(stateKV)
+		}
 
-		// Session State Manager
-		stateKV, _ := NewBoltStore(e.db, "_core/session_states")
-		e.sessionState = NewSessionStateManager(stateKV)
+		// Reflector is optional — injected via WithReflector
+		// No default reflector creation; use reflector plugins instead
 
-		// Reflector
-		e.reflector = NewSessionReflector(e.sessions, nil, e.skillManagers)
-
-		// Plugin instance store (persists dialog/llm configs across restarts)
-		instKV, _ := NewBoltStore(e.db, "_core/plugin_instances")
-		e.instanceStore = NewPluginInstanceStore(instKV)
+		// Plugin instance store
+		instKV, _ := e.store.GetStore("_core/plugin_instances")
+		if instKV != nil {
+			e.instanceStore = NewPluginInstanceStore(instKV)
+		}
 	}
 
 	var storage KVStoreProvider
-	if e.db != nil {
-		storage = NewScopedStoreProvider(e.db, "_core/pipes")
+	if e.store != nil {
+		storage = e.store
 	}
 
 	e.pipes = CreatePipes(PipeContext{
 		Sessions:   e.sessions,
-		Translator: t,
+		Translator: e.translator,
 		Storage:    storage,
 		State:      e.sessionState,
 		GetAgents: func() []AgentInfo {
@@ -146,13 +147,13 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 		},
 	})
 
-	if dataDir != "" {
+	if e.dataDir != "" {
 		var relayStore KVStore
-		if e.db != nil {
-			relayStore, _ = NewBoltStore(e.db, "_core/relays")
+		if e.store != nil {
+			relayStore, _ = e.store.GetStore("_core/relays")
 		}
 		e.relay = NewRelayManager(relayStore, e)
-		api, err := NewAPIServer(dataDir, e)
+		api, err := NewAPIServer(e.dataDir, e)
 		if err != nil {
 			slog.Error("engine: failed to create api server", "error", err)
 		} else {
@@ -162,14 +163,24 @@ func NewEngine(sessions SessionProvider, t Translator, stt SpeechToText, tts Tex
 	return e
 }
 
+// noopTranslator returns the key as-is when no translator is configured.
+type noopTranslator struct{}
+
+func (n *noopTranslator) T(key string, args ...any) string {
+	if len(args) > 0 {
+		return fmt.Sprintf(key, args...)
+	}
+	return key
+}
+
 func (e *Engine) RegisterDialog(p Dialog) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.dialogs[p.Name()] = p
 
 	// Inject scoped storage if the Dialog plugin supports it.
-	if sa, ok := p.(StorageAware); ok && e.db != nil {
-		sa.SetStorage(NewScopedStoreProvider(e.db, "plugins/"+p.Name()))
+	if sa, ok := p.(StorageAware); ok && e.store != nil {
+		sa.SetStorage(&scopedProvider{parent: e.store, prefix: "plugins/" + p.Name()})
 	}
 
 	// Register UI abilities if supported
@@ -187,8 +198,8 @@ func (e *Engine) RegisterLLM(a LLM) {
 	}
 
 	// Inject scoped storage if the LLM plugin supports it.
-	if sa, ok := a.(StorageAware); ok && e.db != nil {
-		sa.SetStorage(NewScopedStoreProvider(e.db, "plugins/"+a.Name()))
+	if sa, ok := a.(StorageAware); ok && e.store != nil {
+		sa.SetStorage(&scopedProvider{parent: e.store, prefix: "plugins/" + a.Name()})
 	}
 
 	// Register UI abilities if supported
@@ -196,9 +207,10 @@ func (e *Engine) RegisterLLM(a LLM) {
 		e.uiAbilities[a.Name()] = wp.GetUIAbility()
 	}
 
-	// Update reflector's evaluator LLM if it's the first one or matches default
+	// Update reflector's evaluator LLM if it supports SetEvalLLM
 	if e.reflector != nil {
-		if r, ok := e.reflector.(*SessionReflector); ok {
+		type evalSetter interface{ SetEvalLLM(LLM) }
+		if r, ok := e.reflector.(evalSetter); ok {
 			r.SetEvalLLM(a)
 		}
 	}
@@ -227,15 +239,12 @@ func (e *Engine) LoadPlugins(cfg EngineConfig) error {
 		e.RegisterLLM(aInst)
 	}
 
-	// 3. Load skill managers
 	e.skillManagerLimits = cfg.SkillManagerLimits
 	for _, smCfg := range cfg.SkillManagers {
 		var storage KVStoreProvider
-		if e.db != nil {
-			// Scoped provider for this plugin
-			storage = NewScopedStoreProvider(e.db, "plugins/"+smCfg.Type)
+		if e.store != nil {
+			storage = &scopedProvider{parent: e.store, prefix: "plugins/" + smCfg.Type}
 		}
-
 		sm, err := CreateSkillManager(smCfg.Type, smCfg.Options, storage)
 		if err != nil {
 			return err
@@ -256,19 +265,18 @@ func (e *Engine) registerSkillManager(sm SkillManager) {
 	smType := sm.Type()
 	limit, ok := e.skillManagerLimits[smType]
 	if !ok {
-		limit = 1 // Default limit
+		limit = 1
 	}
 
 	currentCount := e.loadedSkillTypes[smType]
 	if currentCount >= limit {
-		slog.Warn("skipping skill manager: limit reached for type", "type", smType, "limit", limit, "manager", sm.Name())
+		slog.Warn("skipping skill manager: limit reached", "type", smType, "limit", limit, "manager", sm.Name())
 		return
 	}
 
 	e.skillManagers = append(e.skillManagers, sm)
 	e.loadedSkillTypes[smType]++
 
-	// Register UI abilities if supported
 	if wp, ok := sm.(WebProvider); ok {
 		e.uiAbilities[sm.Name()] = wp.GetUIAbility()
 	}
@@ -276,14 +284,8 @@ func (e *Engine) registerSkillManager(sm SkillManager) {
 	slog.Info("loaded skill manager", "name", sm.Name(), "type", smType, "count", e.loadedSkillTypes[smType], "limit", limit)
 }
 
-// AutoLoad auto-discovers and loads LLM providers and skill managers based on
-// available binaries / environment variables. Dialog plugins are intentionally
-// excluded: they must be explicitly enabled by the operator via the UI (or
-// pre-seeded in the database) so that no QR-code or network connection is
-// opened without deliberate configuration.
+// AutoLoad auto-discovers and loads LLM providers and skill managers.
 func (e *Engine) AutoLoad() {
-	// Auto-discover LLMs — only load if at least one env-var field is populated.
-	// This prevents loading LLMs whose API keys have not been configured yet.
 	for _, name := range ListLLMFactories() {
 		spec, ok := GetPluginConfigSpec(name)
 		if ok && !anyEnvVarSet(spec) {
@@ -298,11 +300,10 @@ func (e *Engine) AutoLoad() {
 		}
 	}
 
-	// Auto-discover skill managers
 	for _, name := range ListSkillManagerFactories() {
 		var storage KVStoreProvider
-		if e.db != nil {
-			storage = NewScopedStoreProvider(e.db, "plugins/"+name)
+		if e.store != nil {
+			storage = &scopedProvider{parent: e.store, prefix: "plugins/" + name}
 		}
 		if sm, err := CreateSkillManager(name, nil, storage); err == nil {
 			e.registerSkillManager(sm)
@@ -312,8 +313,7 @@ func (e *Engine) AutoLoad() {
 	}
 }
 
-// LoadSavedInstances restores all enabled plugin instances that were previously
-// persisted via EnablePlugin. It must be called before Start().
+// LoadSavedInstances restores all enabled plugin instances from the store.
 func (e *Engine) LoadSavedInstances() {
 	if e.instanceStore == nil {
 		return
@@ -331,27 +331,23 @@ func (e *Engine) LoadSavedInstances() {
 		case "dialog":
 			d, err := CreateDialog(inst.PluginName, inst.Config)
 			if err != nil {
-				slog.Error("engine: failed to restore dialog instance", "name", inst.PluginName, "error", err)
+				slog.Error("engine: failed to restore dialog", "name", inst.PluginName, "error", err)
 				continue
 			}
 			e.RegisterDialog(d)
-			slog.Info("engine: restored dialog instance", "name", inst.PluginName)
+			slog.Info("engine: restored dialog", "name", inst.PluginName)
 		}
 	}
 }
 
-// EnablePlugin creates a dialog plugin from pluginName+config, persists the
-// configuration, registers it, and starts it if the engine is already running.
-// Each call for the same pluginName replaces any previously stored config.
+// EnablePlugin creates a dialog plugin, persists its config, and starts it.
 func (e *Engine) EnablePlugin(pluginName string, config map[string]any) error {
 	d, err := CreateDialog(pluginName, config)
 	if err != nil {
 		return fmt.Errorf("engine: failed to create plugin %q: %w", pluginName, err)
 	}
 
-	// Persist the configuration so it survives restarts.
 	if e.instanceStore != nil {
-		// Preserve CreatedAt from an existing record if present.
 		existing, _ := e.instanceStore.Get(pluginName)
 		inst := PluginInstance{
 			ID:         pluginName,
@@ -365,11 +361,10 @@ func (e *Engine) EnablePlugin(pluginName string, config map[string]any) error {
 			inst.CreatedAt = existing.CreatedAt
 		}
 		if err := e.instanceStore.Save(inst); err != nil {
-			slog.Warn("engine: failed to persist plugin instance", "name", pluginName, "error", err)
+			slog.Warn("engine: failed to persist plugin", "name", pluginName, "error", err)
 		}
 	}
 
-	// If an old instance of this plugin is running, stop it first.
 	e.mu.Lock()
 	old, exists := e.dialogs[pluginName]
 	e.mu.Unlock()
@@ -379,7 +374,6 @@ func (e *Engine) EnablePlugin(pluginName string, config map[string]any) error {
 
 	e.RegisterDialog(d)
 
-	// If engine.Start() has already been called, start the dialog immediately.
 	e.mu.RLock()
 	alreadyStarted := e.started
 	e.mu.RUnlock()
@@ -389,8 +383,7 @@ func (e *Engine) EnablePlugin(pluginName string, config map[string]any) error {
 	return nil
 }
 
-// DisablePlugin stops a running dialog plugin and marks it disabled in the store.
-// Disabled instances are not restored on the next startup.
+// DisablePlugin stops a running dialog and marks it disabled.
 func (e *Engine) DisablePlugin(pluginName string) error {
 	e.mu.Lock()
 	d, ok := e.dialogs[pluginName]
@@ -400,7 +393,6 @@ func (e *Engine) DisablePlugin(pluginName string) error {
 	}
 	e.mu.Unlock()
 
-	// Mark disabled in the persistent store.
 	if e.instanceStore != nil {
 		inst, _ := e.instanceStore.Get(pluginName)
 		if inst != nil {
@@ -424,19 +416,20 @@ func (e *Engine) GetPluginInstances() ([]PluginInstance, error) {
 }
 
 func (e *Engine) Start(ctx context.Context) error {
-	if e.cron != nil {
-		if err := e.cron.Start(); err != nil {
-			slog.Error("engine: failed to start cron scheduler", "error", err)
-		}
-	}
 	if e.api != nil {
 		e.api.Start()
 	}
 	if e.sessionState != nil {
 		go func() {
 			ticker := time.NewTicker(5 * time.Minute)
-			for range ticker.C {
-				_ = e.sessionState.CleanupExpired()
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					_ = e.sessionState.CleanupExpired()
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 	}
@@ -455,21 +448,15 @@ func (e *Engine) Start(ctx context.Context) error {
 	<-ctx.Done()
 	return nil
 }
-func (e *Engine) HandleCron(_ *CronJob) error {
-	// Logic to resolve access and send message back to handleMessage
-	return nil
-}
 
-// HandleRelay injects a message from another bot.
+// HandleRelay handles inter-bot communication.
 func (e *Engine) HandleRelay(_ context.Context, _, _, _, _ string) (string, error) {
-	// Logic to handle inter-bot communication
 	return "relay ok", nil
 }
 
 func (e *Engine) GetUIManifest() map[string]UIAbility {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	// Return a copy to avoid mutation
 	m := make(map[string]UIAbility)
 	for k, v := range e.uiAbilities {
 		m[k] = v
@@ -495,44 +482,28 @@ type SkillInfo struct {
 	Manager     string `json:"manager"`
 }
 
-// GetStatus returns the current inventory of loaded components.
 func (e *Engine) GetStatus(ctx context.Context) EngineStatus {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	status := EngineStatus{}
-
 	for _, d := range e.dialogs {
-		status.Dialogs = append(status.Dialogs, ComponentInfo{
-			Name:        d.Name(),
-			Description: "", // Dialog interface doesn't have Description() currently
-		})
+		status.Dialogs = append(status.Dialogs, ComponentInfo{Name: d.Name()})
 	}
-
 	for _, l := range e.llms {
-		status.LLMs = append(status.LLMs, ComponentInfo{
-			Name:        l.Name(),
-			Description: l.Description(),
-		})
+		status.LLMs = append(status.LLMs, ComponentInfo{Name: l.Name(), Description: l.Description()})
 	}
-
 	for _, sm := range e.skillManagers {
 		skills, err := sm.List(ctx)
 		if err == nil {
 			for _, s := range skills {
-				status.Skills = append(status.Skills, SkillInfo{
-					Name:        s.Name,
-					Description: s.Description,
-					Manager:     sm.Name(),
-				})
+				status.Skills = append(status.Skills, SkillInfo{Name: s.Name, Description: s.Description, Manager: sm.Name()})
 			}
 		}
 	}
-
 	return status
 }
 
-// GetDialogInstances returns the health status of all registered bot instances across all platforms.
 func (e *Engine) GetDialogInstances() map[string][]DialogInstanceStatus {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -542,16 +513,12 @@ func (e *Engine) GetDialogInstances() map[string][]DialogInstanceStatus {
 		if md, ok := d.(ManageableDialog); ok {
 			results[name] = md.GetInstances()
 		} else {
-			// Legacy fallback for non-manageable dialogs
-			results[name] = []DialogInstanceStatus{
-				{ID: "default", Status: "connected", Description: "Static platform"},
-			}
+			results[name] = []DialogInstanceStatus{{ID: "default", Status: "connected", Description: "Static platform"}}
 		}
 	}
 	return results
 }
 
-// StartDialogAuth begins an interactive login session for a specific platform.
 func (e *Engine) StartDialogAuth(ctx context.Context, platform string) (*AuthSession, error) {
 	e.mu.RLock()
 	d, ok := e.dialogs[platform]
@@ -566,7 +533,6 @@ func (e *Engine) StartDialogAuth(ctx context.Context, platform string) (*AuthSes
 	return md.StartAuth(ctx)
 }
 
-// PollDialogAuth checks the status of an ongoing login session.
 func (e *Engine) PollDialogAuth(ctx context.Context, platform, sessionID string) (*AuthSession, error) {
 	e.mu.RLock()
 	d, ok := e.dialogs[platform]
@@ -581,7 +547,6 @@ func (e *Engine) PollDialogAuth(ctx context.Context, platform, sessionID string)
 	return md.PollAuth(ctx, sessionID)
 }
 
-// AddDialogInstance adds a new bot instance using provided parameters (tokens/secrets).
 func (e *Engine) AddDialogInstance(ctx context.Context, platform string, params map[string]string) error {
 	e.mu.RLock()
 	d, ok := e.dialogs[platform]
@@ -606,7 +571,6 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	if e.sessionState != nil {
 		state, err := e.sessionState.GetState(msg.SessionKey)
 		if err == nil && state != nil {
-			// Check Global Escape keywords
 			content := strings.ToLower(strings.TrimSpace(msg.Content))
 			if content == "exit" || content == "cancel" || content == "quit" || content == "退出" || content == "取消" {
 				_ = e.sessionState.ClearState(msg.SessionKey)
@@ -614,30 +578,26 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 				return
 			}
 
-			// Logical Lock: Route to specific plugin
 			if state.LockedBy != "" {
-				// Based on design confirmed: "completely shield LLM".
-				// So we ONLY run pipes and then RETURN.
 				for _, pipe := range e.pipes {
 					if pipe.Handle(ctx, p, msg) {
 						return
 					}
 				}
-				// If no pipe handled it but state is locked, it's a "hanging" lock or invalid input.
-				_ = p.Reply(ctx, msg.ReplyCtx, e.translator.T("session_locked_wait", state.Action))
+				_ = p.Reply(ctx, msg.ReplyCtx, fmt.Sprintf(e.translator.T("session_locked_wait"), state.Action))
 				return
 			}
 		}
 	}
 
-	// 1. Run pipe pipeline (Dedup -> Safety -> Command)
+	// 1. Run pipe pipeline
 	for _, pipe := range e.pipes {
 		if pipe.Handle(ctx, p, msg) {
-			return // Intercepted
+			return
 		}
 	}
 
-	// Record incoming message in the Dialog plugin's own storage.
+	// Record incoming message in Dialog plugin's own storage.
 	if recorder, ok := p.(DialogRecorder); ok {
 		if err := recorder.RecordMessage(traceID, msg); err != nil {
 			slog.Warn("engine: dialog record failed", "error", err, "trace_id", traceID)
@@ -645,6 +605,10 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	}
 
 	// 2. Get session
+	if e.sessions == nil {
+		_ = p.Reply(ctx, msg.ReplyCtx, "Error: no session provider configured")
+		return
+	}
 	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 	if !session.TryLock() {
 		_ = p.Reply(ctx, msg.ReplyCtx, e.translator.T("previous_processing"))
@@ -652,24 +616,20 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	}
 	defer session.Unlock()
 
-	// Record user message in history
 	session.AppendHistory(HistoryEntry{Role: RoleUser, Content: msg.Content})
 
-	// --- 权限处理逻辑开始 ---
+	// Permission handling
 	pending := session.GetPendingAction()
 	if strings.HasPrefix(pending, "confirm_tool:") {
 		if msg.Content == "继续" || msg.Content == "好" || msg.Content == "确认" || msg.Content == "允许" {
-			// 清除挂起状态并告知 LLM 用户已同意
 			session.SetPendingAction("")
 			msg.Content = fmt.Sprintf("[User Authorized: %s] 请继续执行刚才的操作。", strings.TrimPrefix(pending, "confirm_tool:"))
 		} else {
-			// 用户发了别的，认为是在取消授权或提新问题
 			session.SetPendingAction("")
 		}
 	}
-	// --- 权限处理逻辑结束 ---
 
-	// 4. Start llm session
+	// 3. Select LLM
 	llmName, _ := session.GetMetadata()["llm"].(string)
 	if llmName == "" {
 		llmName = e.defaultLLM
@@ -707,7 +667,6 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 		return
 	}
 
-	// Notify the LLM session about the current trace ID for self-recording.
 	if sr, ok := agSess.(SessionRecorder); ok {
 		sr.SetTraceID(traceID)
 	}
@@ -716,7 +675,6 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	defer func() {
 		_ = agSess.Close()
 
-		// Record interaction index in Core.
 		if e.interactionLogger != nil {
 			e.interactionLogger.Record(InteractionRef{
 				TraceID:         traceID,
@@ -730,13 +688,12 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 			})
 		}
 
-		// Trigger Reflector for skill evaluation
 		if e.reflector != nil && interactionStatus == "completed" && len(usedSkillList) > 0 {
 			_ = e.reflector.Reflect(context.Background(), msg.SessionKey, traceID, usedSkillList)
 		}
 	}()
 
-	// 4.5 Inject skills if available
+	// 4. Inject skills
 	finalContent := msg.Content
 	var allSkills []*Skill
 	for _, sm := range e.skillManagers {
@@ -747,26 +704,25 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 	}
 
 	if len(allSkills) > 0 {
-		index := BuildSkillIndexPrompt(allSkills)
+		index := buildSkillIndexPrompt(allSkills)
 		for _, s := range allSkills {
 			usedSkillList = append(usedSkillList, s.Name)
 		}
 		if pinj, ok := targetLLM.(PlatformPromptInjector); ok {
 			pinj.SetPlatformPrompt(AgentSystemPrompt() + index)
 		} else {
-			// Fallback: prepend to content for models without system prompt support
 			finalContent = fmt.Sprintf("[SYSTEM: %s]\n\n%s", index, msg.Content)
 		}
 	}
 
-	// 5. Send message to llm
+	// 5. Send message to LLM
 	err = agSess.Send(finalContent, msg.Images, msg.Files)
 	if err != nil {
 		_ = p.Reply(ctx, msg.ReplyCtx, "Error sending message: "+err.Error())
 		return
 	}
 
-	// 6. Handle llm events
+	// 6. Handle LLM events
 	var textBuffer strings.Builder
 	lastFlush := time.Now()
 
@@ -785,7 +741,6 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 		case EventText:
 			if ev.Content != "" {
 				textBuffer.WriteString(ev.Content)
-				// 通用策略：150字符或3秒发送一次
 				if textBuffer.Len() > 150 || time.Since(lastFlush) > 3*time.Second {
 					flushBuffer()
 				}
@@ -800,7 +755,7 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 			_ = p.Reply(ctx, msg.ReplyCtx, fmt.Sprintf("🔍 正在使用工具: %s...", ev.ToolName))
 		case EventPermissionRequest:
 			flushBuffer()
-			_ = p.Reply(ctx, msg.ReplyCtx, fmt.Sprintf("🛡️ 权限请求: %s 想执行 %s(%s)。\n\n回复“继续”允许。", ev.ToolName, ev.ToolName, ev.ToolInput))
+			_ = p.Reply(ctx, msg.ReplyCtx, fmt.Sprintf("🛡️ 权限请求: %s 想执行 %s(%s)。\n\n回复「继续」允许。", ev.ToolName, ev.ToolName, ev.ToolInput))
 			session.SetPendingAction("confirm_tool:" + ev.ToolName)
 			interactionStatus = "interrupted"
 			return
@@ -818,14 +773,11 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 				_ = p.Reply(ctx, msg.ReplyCtx, "❌ 错误: "+ev.Error.Error())
 			}
 			if ev.Done {
-				// Record assistant response in history
 				session.AppendHistory(HistoryEntry{Role: RoleAssistant, Content: textBuffer.String()})
 
-				// Autonomous Evolution: Trigger skill extraction at end of session
 				if len(e.skillManagers) > 0 {
 					go func() {
 						slog.Info("engine: triggering skill extraction", "session", actualSessionID)
-						// Fetch history from LLM if supported
 						var history []HistoryEntry
 						if hp, ok := targetLLM.(HistoryProvider); ok {
 							history, _ = hp.GetSessionHistory(ctx, actualSessionID, 50)
@@ -841,4 +793,40 @@ func (e *Engine) handleMessage(p Dialog, msg *Message) {
 			}
 		}
 	}
+}
+
+// buildSkillIndexPrompt constructs a compact index of available skills.
+func buildSkillIndexPrompt(skills []*Skill) string {
+	if len(skills) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n## Available Skills\n")
+	sb.WriteString("You have the following skills available.\n\n")
+	for _, s := range skills {
+		name := s.DisplayName
+		if name == "" {
+			name = s.Name
+		}
+		fmt.Fprintf(&sb, "- %s: %s\n", name, s.Description)
+	}
+	sb.WriteString("\nTo use a skill, refer to its instructions or ask the user to invoke it.")
+	return sb.String()
+}
+
+// scopedProvider wraps a KVStoreProvider to add a prefix.
+type scopedProvider struct {
+	parent KVStoreProvider
+	prefix string
+}
+
+func (sp *scopedProvider) GetStore(name string) (KVStore, error) {
+	fullName := sp.prefix
+	if name != "" {
+		if fullName != "" && fullName[len(fullName)-1] != '/' {
+			fullName += "/"
+		}
+		fullName += name
+	}
+	return sp.parent.GetStore(fullName)
 }

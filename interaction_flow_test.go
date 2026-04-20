@@ -62,7 +62,7 @@ func TestInteractionTraceFlow_Table(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
 			sp := &mockSessionProviderManual{sessions: make(map[string]Session)}
-			e := NewEngine(sp, nil, nil, nil, tmpDir)
+			e := NewEngine(WithSessions(sp), WithDataDir(tmpDir))
 
 			md := &MockDialog{NameVal: tt.dialogName}
 			e.RegisterDialog(md)
