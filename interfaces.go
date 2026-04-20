@@ -695,3 +695,176 @@ type Reflector interface {
 	// Reflect evaluates a session's outcome and updates skill/agent metrics.
 	Reflect(ctx context.Context, sessionKey, traceID string, usedSkills []string) error
 }
+
+// ──────────────────────────────────────────────────────────────
+// Hook System
+// ──────────────────────────────────────────────────────────────
+
+// HookEvent describes a lifecycle hook event fired by the Engine.
+type HookEvent struct {
+	Name       string         `json:"event"`
+	SessionKey string         `json:"session_key,omitempty"`
+	UserID     string         `json:"user_id,omitempty"`
+	Content    string         `json:"content,omitempty"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
+}
+
+// HookHandler is implemented by pipe plugins that want to receive lifecycle events
+// fired from the Engine (e.g., message.sent).
+type HookHandler interface {
+	FireHook(event HookEvent)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Outbound Rate Limiting
+// ──────────────────────────────────────────────────────────────
+
+// OutboundLimiter controls the rate at which the Engine sends messages to a platform.
+// Implemented by the outbound_rl pipe plugin.
+type OutboundLimiter interface {
+	Wait(ctx context.Context, platform string) error
+}
+
+// ──────────────────────────────────────────────────────────────
+// Context Assembly (Memory Engine Extension)
+// ──────────────────────────────────────────────────────────────
+
+// ContextAssembler is implemented by memory SkillManager plugins.
+// Engine calls AssembleContext before each LLM request to get compressed history.
+type ContextAssembler interface {
+	AssembleContext(sessionKey string, budget int) ([]HistoryEntry, error)
+	IngestMessage(sessionKey string, entry HistoryEntry) error
+}
+
+// ──────────────────────────────────────────────────────────────
+// MCP Tool Provider
+// ──────────────────────────────────────────────────────────────
+
+// LLMTool describes a callable tool (Function Call / Tool Use schema).
+type LLMTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// MCPToolProvider is implemented by MCP-capable SkillManager plugins.
+// Engine collects all tools before building the LLM request.
+type MCPToolProvider interface {
+	GetTools() []LLMTool
+	CallTool(ctx context.Context, name string, args map[string]any) (string, error)
+}
+
+// ──────────────────────────────────────────────────────────────
+// SubTask / Sub-Agent
+// ──────────────────────────────────────────────────────────────
+
+// SubTaskStatus is the result snapshot of a spawned sub-task.
+type SubTaskStatus struct {
+	ID     string `json:"id"`
+	State  string `json:"state"` // "running" | "done" | "error" | "not_found"
+	Result string `json:"result,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// SubTaskManager is implemented by the subtask SkillManager plugin.
+type SubTaskManager interface {
+	Spawn(ctx context.Context, sessionKey, prompt string, budget int) (string, error)
+	GetStatus(taskID string) SubTaskStatus
+}
+
+// ──────────────────────────────────────────────────────────────
+// StorageBackend Plugin
+// ──────────────────────────────────────────────────────────────
+
+// StorageBackend is a pluggable key-value storage backend.
+// The default implementation is BoltDB (built into core).
+// Optional implementations: Redis, SQLite (via plugins).
+type StorageBackend interface {
+	Open(namespace string) (KVStore, error)
+	Close() error
+}
+
+// StorageFactory creates a StorageBackend from options.
+type StorageFactory func(opts map[string]any) (StorageBackend, error)
+
+// ──────────────────────────────────────────────────────────────
+// Trigger Plugin
+// ──────────────────────────────────────────────────────────────
+
+// TriggerEvent is the event produced by a Trigger plugin and delivered to Engine.
+type TriggerEvent struct {
+	Source     string         `json:"source"`
+	SessionKey string         `json:"session_key,omitempty"`
+	Payload    string         `json:"payload"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
+}
+
+// Trigger is a plugin type that actively generates events (unlike Pipe which reacts).
+// Examples: CronTrigger, MQTTTrigger.
+type Trigger interface {
+	Start(ctx context.Context, handler func(TriggerEvent)) error
+}
+
+// TriggerFactory creates a Trigger from options.
+type TriggerFactory func(opts map[string]any) (Trigger, error)
+
+// ──────────────────────────────────────────────────────────────
+// Lifecycle (optional interface for all plugin types)
+// ──────────────────────────────────────────────────────────────
+
+// LifecycleAware may be implemented by any plugin to participate in
+// the Engine's startup/shutdown sequence and health-check loop.
+type LifecycleAware interface {
+	Start(ctx context.Context) error
+	Stop(ctx context.Context) error
+	Health(ctx context.Context) error
+}
+
+// ──────────────────────────────────────────────────────────────
+// SecretProvider Plugin
+// ──────────────────────────────────────────────────────────────
+
+// SecretProvider abstracts the source of secret values (env, Vault, KMS, …).
+type SecretProvider interface {
+	Get(ctx context.Context, key string) (string, error)
+}
+
+// SecretProviderFactory creates a SecretProvider from options.
+type SecretProviderFactory func(opts map[string]any) (SecretProvider, error)
+
+// ──────────────────────────────────────────────────────────────
+// EventBus Plugin
+// ──────────────────────────────────────────────────────────────
+
+// EventSubscription represents an active subscription to a topic.
+type EventSubscription interface {
+	Close() error
+}
+
+// EventBus provides publish-subscribe messaging across plugin boundaries.
+type EventBus interface {
+	Publish(ctx context.Context, topic string, payload []byte) error
+	Subscribe(ctx context.Context, topic string, handler func([]byte)) (EventSubscription, error)
+}
+
+// EventBusFactory creates an EventBus from options.
+type EventBusFactory func(opts map[string]any) (EventBus, error)
+
+// ──────────────────────────────────────────────────────────────
+// PolicyEngine Plugin
+// ──────────────────────────────────────────────────────────────
+
+// PolicyDecision is the outcome of a policy evaluation.
+type PolicyDecision struct {
+	Allow     bool
+	Reason    string
+	Overrides map[string]any
+}
+
+// PolicyEngine evaluates policies (RBAC, guardrail, routing) at runtime.
+type PolicyEngine interface {
+	Evaluate(ctx context.Context, policy string, input map[string]any) (PolicyDecision, error)
+}
+
+// PolicyEngineFactory creates a PolicyEngine from options.
+type PolicyEngineFactory func(opts map[string]any) (PolicyEngine, error)

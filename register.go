@@ -171,3 +171,160 @@ func CreateSkillManager(name string, opts map[string]any, storage KVStoreProvide
 	}
 	return factory(opts)
 }
+
+// ──────────────────────────────────────────────────────────────
+// Storage Backend Registry
+// ──────────────────────────────────────────────────────────────
+
+var (
+	storageFactories = make(map[string]StorageFactory)
+	storageMu        sync.RWMutex
+)
+
+// RegisterStorage registers a StorageBackend factory by name.
+func RegisterStorage(name string, factory StorageFactory) {
+	storageMu.Lock()
+	defer storageMu.Unlock()
+	storageFactories[name] = factory
+}
+
+// CreateStorage instantiates a StorageBackend by its registered name.
+func CreateStorage(name string, opts map[string]any) (StorageBackend, error) {
+	storageMu.RLock()
+	factory, ok := storageFactories[name]
+	storageMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown storage backend %q", name)
+	}
+	return factory(opts)
+}
+
+// ListStorageFactories returns the names of all registered storage backends.
+func ListStorageFactories() []string {
+	storageMu.RLock()
+	defer storageMu.RUnlock()
+	list := make([]string, 0, len(storageFactories))
+	for name := range storageFactories {
+		list = append(list, name)
+	}
+	return list
+}
+
+// ──────────────────────────────────────────────────────────────
+// Trigger Registry
+// ──────────────────────────────────────────────────────────────
+
+var (
+	triggerFactories = make(map[string]TriggerFactory)
+	triggerMu        sync.RWMutex
+)
+
+// RegisterTrigger registers a Trigger factory by name.
+func RegisterTrigger(name string, factory TriggerFactory) {
+	triggerMu.Lock()
+	defer triggerMu.Unlock()
+	triggerFactories[name] = factory
+}
+
+// CreateTrigger instantiates a Trigger by its registered name.
+func CreateTrigger(name string, opts map[string]any) (Trigger, error) {
+	triggerMu.RLock()
+	factory, ok := triggerFactories[name]
+	triggerMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown trigger %q", name)
+	}
+	return factory(opts)
+}
+
+// ListTriggerFactories returns names of all registered triggers.
+func ListTriggerFactories() []string {
+	triggerMu.RLock()
+	defer triggerMu.RUnlock()
+	list := make([]string, 0, len(triggerFactories))
+	for name := range triggerFactories {
+		list = append(list, name)
+	}
+	return list
+}
+
+// ──────────────────────────────────────────────────────────────
+// SecretProvider Registry
+// ──────────────────────────────────────────────────────────────
+
+var (
+	secretFactories = make(map[string]SecretProviderFactory)
+	secretMu        sync.RWMutex
+)
+
+// RegisterSecretProvider registers a SecretProvider factory by name.
+func RegisterSecretProvider(name string, factory SecretProviderFactory) {
+	secretMu.Lock()
+	defer secretMu.Unlock()
+	secretFactories[name] = factory
+}
+
+// CreateSecretProvider instantiates a SecretProvider by its registered name.
+func CreateSecretProvider(name string, opts map[string]any) (SecretProvider, error) {
+	secretMu.RLock()
+	factory, ok := secretFactories[name]
+	secretMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown secret provider %q", name)
+	}
+	return factory(opts)
+}
+
+// ──────────────────────────────────────────────────────────────
+// EventBus Registry
+// ──────────────────────────────────────────────────────────────
+
+var (
+	eventBusFactories = make(map[string]EventBusFactory)
+	eventBusMu        sync.RWMutex
+)
+
+// RegisterEventBus registers an EventBus factory by name.
+func RegisterEventBus(name string, factory EventBusFactory) {
+	eventBusMu.Lock()
+	defer eventBusMu.Unlock()
+	eventBusFactories[name] = factory
+}
+
+// CreateEventBus instantiates an EventBus by its registered name.
+func CreateEventBus(name string, opts map[string]any) (EventBus, error) {
+	eventBusMu.RLock()
+	factory, ok := eventBusFactories[name]
+	eventBusMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown event bus %q", name)
+	}
+	return factory(opts)
+}
+
+// ──────────────────────────────────────────────────────────────
+// PolicyEngine Registry
+// ──────────────────────────────────────────────────────────────
+
+var (
+	policyFactories = make(map[string]PolicyEngineFactory)
+	policyMu        sync.RWMutex
+)
+
+// RegisterPolicyEngine registers a PolicyEngine factory by name.
+func RegisterPolicyEngine(name string, factory PolicyEngineFactory) {
+	policyMu.Lock()
+	defer policyMu.Unlock()
+	policyFactories[name] = factory
+}
+
+// CreatePolicyEngine instantiates a PolicyEngine by its registered name.
+func CreatePolicyEngine(name string, opts map[string]any) (PolicyEngine, error) {
+	policyMu.RLock()
+	factory, ok := policyFactories[name]
+	policyMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown policy engine %q", name)
+	}
+	return factory(opts)
+}
